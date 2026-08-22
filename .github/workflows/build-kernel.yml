@@ -659,7 +659,11 @@ jobs:
           cat SHA256SUMS
           echo "attaching ${#assets[@]} assets"
 
-          "$GITHUB_WORKSPACE/recipe/scripts/release-notes.sh" \
+          # Invoked through `bash` rather than executed directly: the repo is
+          # authored on Windows with core.filemode=false, so a missing exec bit
+          # in the index is easy to introduce and would only ever show up here,
+          # as Permission denied, after a ~25 minute build.
+          bash "$GITHUB_WORKSPACE/recipe/scripts/release-notes.sh" \
             "$KVER" "$ZIPNAME" "$MODE" "$BUILD_SCOPE" "$GITHUB_RUN_NUMBER" \
             "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
             > /tmp/notes.md
