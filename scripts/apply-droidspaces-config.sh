@@ -38,8 +38,20 @@ DS_SYMBOLS=(
   NETFILTER_XT_MATCH_ADDRTYPE
   # Fix for docker "unsafe procfs" error
   USER_NS
-  # UFW support
-  NETFILTER_XT_TARGET_REJECT
+  # UFW support.
+  #
+  # The DroidSpaces docs spell the REJECT target NETFILTER_XT_TARGET_REJECT.
+  # That symbol does not exist in Linux 6.6 (nor in mainline): net/netfilter
+  # has 26 NETFILTER_XT_TARGET_* symbols and REJECT is not among them, and
+  # net/netfilter/xt_REJECT.c does not exist either. The real symbols are the
+  # per-family ones, IP_NF_TARGET_REJECT (net/ipv4/netfilter/Kconfig) and
+  # IP6_NF_TARGET_REJECT (net/ipv6/netfilter/Kconfig), both of which are
+  # already =y in the stock algiz gki_defconfig. Writing the documented
+  # spelling would be silently discarded by merge_config.sh/olddefconfig
+  # (no such Kconfig symbol) and would leave UFW's REJECT rules unavailable
+  # while looking like it had been applied.
+  IP_NF_TARGET_REJECT
+  IP6_NF_TARGET_REJECT
   NETFILTER_XT_TARGET_LOG
   NETFILTER_XT_MATCH_RECENT
   # Fail2ban support
@@ -54,7 +66,28 @@ DS_SYMBOLS=(
 
 # Options DroidSpaces treats as fatal-if-missing. Not written by this script
 # unless they are also in DS_SYMBOLS; only verified afterwards.
-DS_REQUIRED=(PID_NS NAMESPACES UTS_NS IPC_NS CGROUP_DEVICE DEVTMPFS)
+DS_REQUIRED=(PID_NS NAMESPACES UTS_NS IPC_NS DEVTMPFS)
+
+# CGROUP_DEVICE is called "Fatal. Containers cannot start." by the DroidSpaces
+# documentation, but it is deliberately NOT enabled here, and not treated as
+# required:
+#
+#   * It appears only in the doc's non-GKI list, not the GKI-exclusive list.
+#   * DroidSpaces' own runtime probe (Droidspaces-OSS check.c) never looks for
+#     it. Its cgroup probes are /proc/filesystems:cgroup2 and
+#     check_ns(CLONE_NEWCGROUP), both flagged OPT.
+#   * devices_cgrp_subsys in security/device_cgroup.c defines only
+#     .legacy_cftypes, i.e. it is cgroup-v1 only. Android 16 boots pure
+#     cgroup v2 for the container-relevant hierarchies, so the controller
+#     would not even be mounted.
+#   * It is a kABI hazard: include/linux/cgroup_subsys.h gates SUBSYS(devices)
+#     on CONFIG_CGROUP_DEVICE, between MEMCG and CGROUP_FREEZER. Enabling it
+#     inserts a cgroup_subsys_id enum value and shifts every subsequent ID,
+#     which prebuilt vendor modules were compiled against. That is exactly the
+#     class of breakage the SYSVIPC padding patch exists to avoid.
+#
+# It is reported for information only.
+DS_INFORMATIONAL=(CGROUP_DEVICE)
 
 cp -f "$DEFCONFIG" "${DEFCONFIG}.droidspaces.bak"
 
@@ -110,11 +143,19 @@ for sym in "${DS_REQUIRED[@]}"; do
     echo "  FAIL      CONFIG_${sym} present but not =y"
     bad=1
   else
-    # Absent from defconfig. For UTS_NS / CGROUP_DEVICE this is expected on
-    # GKI: they are not listed but come from Kconfig defaults / dependencies.
-    # Kconfig for 6.6: UTS_NS "default y", CGROUP_DEVICE selected by
-    # CGROUP_BPF users. Report so the .config check can confirm it later.
+    # Absent from defconfig. For UTS_NS this is expected on GKI: it is not
+    # listed but comes from Kconfig defaults (UTS_NS is "default y" in 6.6).
+    # Report so the .config check can confirm it later.
     echo "  defer     CONFIG_${sym} not in defconfig (verify in built .config)"
+  fi
+done
+
+echo "==> Informational (documented as fatal, deliberately not enabled - see above)"
+for sym in "${DS_INFORMATIONAL[@]}"; do
+  if grep -qx -- "CONFIG_${sym}=y" "$DEFCONFIG"; then
+    echo "  note      CONFIG_${sym}=y (came from the vendor config, not from us)"
+  else
+    echo "  note      CONFIG_${sym} not enabled (cgroup-v1 only, unprobed, kABI hazard)"
   fi
 done
 

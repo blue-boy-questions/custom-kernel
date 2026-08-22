@@ -409,9 +409,14 @@ jobs:
 
           fail=0
           echo "== DroidSpaces GKI-exclusive options =="
+          # NOTE: the DroidSpaces docs list NETFILTER_XT_TARGET_REJECT, which is
+          # not a Kconfig symbol in Linux 6.6 (no net/netfilter/xt_REJECT.c
+          # either). The real per-family symbols are checked instead; both are
+          # already =y in the stock algiz gki_defconfig.
           for s in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS \
                    NETFILTER_XT_MATCH_ADDRTYPE USER_NS \
-                   NETFILTER_XT_TARGET_REJECT NETFILTER_XT_TARGET_LOG \
+                   IP_NF_TARGET_REJECT IP6_NF_TARGET_REJECT \
+                   NETFILTER_XT_TARGET_LOG \
                    NETFILTER_XT_MATCH_RECENT \
                    IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET \
                    TMPFS_POSIX_ACL TMPFS_XATTR; do
@@ -423,8 +428,15 @@ jobs:
             esac
           done
 
+          # Guard against the docs' spelling silently coming back: if a future
+          # kernel really does grow NETFILTER_XT_TARGET_REJECT, say so instead
+          # of failing.
+          if grep -q '^CONFIG_NETFILTER_XT_TARGET_REJECT=' "$cfg"; then
+            echo "  note  CONFIG_NETFILTER_XT_TARGET_REJECT exists in this tree after all"
+          fi
+
           echo "== DroidSpaces fatal-if-missing options =="
-          for s in NAMESPACES UTS_NS IPC_NS PID_NS CGROUP_DEVICE DEVTMPFS; do
+          for s in NAMESPACES UTS_NS IPC_NS PID_NS DEVTMPFS; do
             if grep -qx "CONFIG_${s}=y" "$cfg"; then
               printf '  ok    CONFIG_%s=y\n' "$s"
             else
@@ -432,6 +444,18 @@ jobs:
               fail=1
             fi
           done
+
+          # CGROUP_DEVICE: the docs call it fatal, but only in their non-GKI
+          # list. DroidSpaces' runtime check never probes it; devices_cgrp_subsys
+          # is cgroup-v1 only (.legacy_cftypes, security/device_cgroup.c); and
+          # enabling it inserts a SUBSYS(devices) entry in
+          # include/linux/cgroup_subsys.h, shifting every later cgroup_subsys_id
+          # - a kABI break for prebuilt vendor modules. Reported, never fatal.
+          if grep -qx "CONFIG_CGROUP_DEVICE=y" "$cfg"; then
+            echo "  note  CONFIG_CGROUP_DEVICE=y (from the vendor config)"
+          else
+            echo "  note  CONFIG_CGROUP_DEVICE not set - intentional, see comment"
+          fi
 
           echo "== recommended by the DroidSpaces runtime check =="
           for s in EPOLL SIGNALFD BLK_DEV_LOOP EXT4_FS CGROUPS CGROUP_PIDS \

@@ -15,12 +15,12 @@ Nothing else is changed. **No root solution is compiled into this kernel** — s
 DroidSpaces needs Linux namespaces and IPC features that Android's GKI
 `gki_defconfig` ships disabled. Two changes are required, and only two:
 
-1. **The config fragment.** 16 symbols are enabled in
+1. **The config fragment.** 17 symbols are enabled in
    `kernel-6.6/arch/arm64/configs/gki_defconfig`
    ([scripts/apply-droidspaces-config.sh](scripts/apply-droidspaces-config.sh)) —
    SYSVIPC, POSIX message queues, IPC/PID namespaces, devtmpfs, user
-   namespaces, the netfilter matches UFW and fail2ban need, and tmpfs
-   xattr/POSIX-ACL support.
+   namespaces, the netfilter matches and targets UFW and fail2ban need, and
+   tmpfs xattr/POSIX-ACL support.
 
 2. **The kABI patch.** Turning on `CONFIG_SYSVIPC` normally adds
    `sysvsem`/`sysvshm` to `struct task_struct`, which shifts every field after
@@ -159,6 +159,32 @@ root solution, DroidSpaces is expected to misbehave; use a plain build.
 ---
 
 ## Notes and caveats
+
+- **Two symbols in the DroidSpaces documentation are wrong for this kernel, and
+  the build corrects them.**
+  - `CONFIG_NETFILTER_XT_TARGET_REJECT` **does not exist in Linux 6.6.**
+    `net/netfilter/Kconfig` defines 26 `NETFILTER_XT_TARGET_*` symbols and
+    REJECT is not one of them; there is no `net/netfilter/xt_REJECT.c` either.
+    The real symbols are the per-family `IP_NF_TARGET_REJECT`
+    (`net/ipv4/netfilter/Kconfig:183`) and `IP6_NF_TARGET_REJECT`
+    (`net/ipv6/netfilter/Kconfig:196`), and both are **already `=y`** in the
+    stock `algiz` `gki_defconfig`. Those are what the scripts write and verify.
+    Writing the documented spelling would be silently dropped by
+    `merge_config.sh`/`olddefconfig` — a `CONFIG_X=y` line for a nonexistent
+    Kconfig symbol vanishes without a warning — so UFW's REJECT rules would be
+    missing while the config looked applied.
+  - `CONFIG_CGROUP_DEVICE` is **deliberately left off**, and demoted from fatal
+    to informational. The docs call it "Fatal. Containers cannot start.", but
+    only in their *non-GKI* list. DroidSpaces' own runtime probe never looks for
+    it — its cgroup checks are `/proc/filesystems:cgroup2` and
+    `check_ns(CLONE_NEWCGROUP)`, both marked `OPT`. `devices_cgrp_subsys` in
+    `security/device_cgroup.c` defines only `.legacy_cftypes`, i.e. cgroup **v1
+    only**, which Android 16 does not use for the container hierarchies. And
+    enabling it is a kABI break: `include/linux/cgroup_subsys.h` gates
+    `SUBSYS(devices)` on it, between `MEMCG` and `CGROUP_FREEZER`, so turning it
+    on inserts a `cgroup_subsys_id` enum value and shifts every later ID — the
+    exact class of breakage the SYSVIPC padding patch exists to prevent. The
+    verify step reports its state and never fails on it.
 
 - **`patches/001.GKI-below-6.12-fix_sysvipc_kabi_1_2_3.patch` does not apply to
   this tree** — its second hunk fails at line 1508 of `include/linux/sched.h` on
