@@ -39,6 +39,12 @@ on:
         type: boolean
         default: true
   push:
+    # branches: is required, not decoration. Without it a *tag* push also matches
+    # this trigger, so creating a release tag starts a fresh ~25-minute build of
+    # the commit the tag points at. The run's own github.token does not trigger
+    # workflows, so the "Publish release" step below cannot loop, but a tag pushed
+    # by a human or a PAT would.
+    branches: [main]
     paths:
       - ".github/workflows/build-kernel.yml"
       - "patches/**"
