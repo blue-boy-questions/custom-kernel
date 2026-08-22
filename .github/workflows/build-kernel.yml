@@ -1,0 +1,577 @@
+# ---------------------------------------------------------------------------
+# Volla Phone Quintus (algiz) - DroidSpaces-enabled Linux 6.6 kernel
+#
+# Builds HelloVolla's MT6877 kernel (6.6.89) with Kleaf/Bazel, patched so that
+# DroidSpaces-OSS works, and packages the result as an AnyKernel3 zip and
+# (optionally) a repacked boot.img.
+#
+# No root solution is compiled into this kernel by design - see README.md.
+# ---------------------------------------------------------------------------
+name: Build algiz DroidSpaces kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_scope:
+        description: "image = GKI Image only (default, kABI-safe). dist = full MediaTek dist build (all vendor modules, ~3-5h)"
+        type: choice
+        default: image
+        options: [image, dist]
+      mode:
+        description: "MTK build variant. user = production (pure gki_defconfig). userdebug/eng add MTK debug configs (PANIC_ON_WARN, KMEMLEAK) - not for daily use."
+        type: choice
+        default: user
+        options: [user, userdebug, eng]
+      defconfig_overlays:
+        description: "DEFCONFIG_OVERLAYS for the device-module side (space separated). Use the literal word none for an empty list."
+        type: string
+        default: mt6877_overlay.config
+      boot_img_url:
+        description: "Optional direct download URL of your STOCK boot.img. If set (or boot/boot.img is committed), a flashable boot.img is repacked."
+        type: string
+        default: ""
+      disable_sandbox:
+        description: "Add --config=local (disables the Bazel sandbox). Only needed if you hit sandbox errors."
+        type: boolean
+        default: false
+  push:
+    paths:
+      - ".github/workflows/build-kernel.yml"
+      - "patches/**"
+      - "scripts/**"
+      - "local_manifests/**"
+      - "anykernel3/**"
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_DIR: kernel-6.6
+  DEVICE_MODULES_DIR: kernel_device_modules-6.6
+  PROJECT: mgk_64_k66
+  KERNEL_VERSION_NUM: "6.6"
+  # kernel_device_modules-6.6/kernel/kleaf/_setup_env.sh derives this as
+  # kernel-${KERNEL_VERSION_NUM}; bazel.WORKSPACE feeds it to
+  # define_kleaf_workspace(common_kernel_package = "@//"+KERNEL_VERSION), so an
+  # empty value silently breaks workspace evaluation.
+  KERNEL_VERSION: kernel-6.6
+  # kernel_device_modules-6.6/scripts/gki_checker.py needs a prebuilt AOSP
+  # vmlinux under ../vendor/aosp_gki/ which is not part of the manifest.
+  KLEAF_GKI_CHECKER: "no"
+  BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN: "1"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: recipe
+
+      - name: Reclaim disk space and pick a workspace location
+        run: |
+          set -euo pipefail
+          echo "::group::before"
+          df -h / /mnt || true
+          echo "::endgroup::"
+
+          # The Kleaf/Bazel tree plus the sandbox needs ~45-60 GB. Drop the
+          # pre-installed toolchains we do not use.
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/.ghcup \
+            /opt/ghc \
+            /usr/share/swift \
+            /usr/local/share/powershell \
+            /usr/local/lib/node_modules \
+            /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+
+          # Prefer the ephemeral /mnt disk: it is the biggest single filesystem
+          # on a GitHub-hosted runner.
+          pick=""
+          for cand in /mnt "$RUNNER_TEMP" "$GITHUB_WORKSPACE/.."; do
+            [ -d "$cand" ] || continue
+            avail=$(df -BG --output=avail "$cand" 2>/dev/null | tail -1 | tr -dc '0-9')
+            [ -n "${avail:-}" ] || continue
+            echo "candidate $cand -> ${avail} GiB free"
+            if [ "$avail" -ge 40 ]; then pick="$cand"; break; fi
+          done
+          [ -n "$pick" ] || { echo "::error::no filesystem with >=40 GiB free"; df -h; exit 1; }
+
+          ws="$pick/algiz"
+          sudo mkdir -p "$ws"
+          sudo chown "$(id -u):$(id -g)" "$ws"
+          echo "WS=$ws" >> "$GITHUB_ENV"
+          echo "Workspace: $ws"
+
+          echo "::group::after"
+          df -h / /mnt || true
+          echo "::endgroup::"
+      - name: Install host build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          # Kleaf brings its own hermetic clang/python3/build-tools; these are
+          # only needed by repo, the patch step and the packaging steps.
+          sudo apt-get install -y --no-install-recommends \
+            git curl python3 rsync zip unzip lz4 zstd bc bison flex \
+            patch diffutils libssl-dev ca-certificates
+          repo_bin="$HOME/.bin"
+          mkdir -p "$repo_bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$repo_bin/repo"
+          chmod a+x "$repo_bin/repo"
+          echo "$repo_bin" >> "$GITHUB_PATH"
+
+      - name: Sync kernel sources (repo)
+        run: |
+          set -euo pipefail
+          bash recipe/scripts/setup-workspace.sh "$WS" recipe/local_manifests/algiz.xml
+
+      - name: Apply the DroidSpaces SYSVIPC kABI patch
+        working-directory: ${{ env.WS }}
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          # Guard: the padding-slot rewrite only works if slots 6/7/8 are still
+          # free in this tree. If ANDROID_KABI_USE(6, ... already exists, some
+          # other change took the slot and the patch must be re-based.
+          if grep -q 'ANDROID_KABI_USE(6,' include/linux/sched.h; then
+            echo "::error::ANDROID_KABI slot 6 is already used in include/linux/sched.h"
+            exit 1
+          fi
+          for slot in 6 7 8; do
+            grep -q "ANDROID_KABI_RESERVE(${slot});" include/linux/sched.h \
+              || { echo "::error::ANDROID_KABI_RESERVE(${slot}) not found in task_struct"; exit 1; }
+          done
+
+          applied=""
+          # 6_7_8 is the variant matching this tree (slots 6/7/8 free). 3_4_5 is
+          # the working fallback. 1_2_3 is shipped for completeness but hunk 2
+          # does not apply to 6.6.89 - it is tried last on purpose.
+          for p in 001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch \
+                   001.GKI-below-6.12-fix_sysvipc_kabi_3_4_5.patch \
+                   001.GKI-below-6.12-fix_sysvipc_kabi_1_2_3.patch; do
+            pf="$GITHUB_WORKSPACE/recipe/patches/$p"
+            [ -f "$pf" ] || continue
+            # Default fuzz (2) is required: hunk 1 lands at offset -2 and hunk 2
+            # at offset 8 in 6.6.89.
+            if patch -p1 --dry-run --silent < "$pf" >/dev/null 2>&1; then
+              patch -p1 < "$pf"
+              applied="$p"
+              break
+            fi
+            echo "skip (does not apply): $p"
+          done
+          [ -n "$applied" ] || { echo "::error::no SYSVIPC kABI patch applied"; exit 1; }
+          echo "Applied: $applied"
+
+          echo "::group::resulting task_struct hunks"
+          grep -n 'sysvsem\|sysvshm\|ANDROID_KABI_USE(6\|_ANDROID_KABI_REPLACE' include/linux/sched.h
+          echo "::endgroup::"
+
+          # The commented-out members must be gone from the CONFIG_SYSVIPC block
+          # near the top of task_struct, or offsets shift and vendor modules break.
+          if grep -qE '^\s+struct sysv_(sem|shm)\s+sysv(sem|shm);' include/linux/sched.h; then
+            echo "::error::sysvsem/sysvshm are still live task_struct members"
+            exit 1
+          fi
+
+      - name: Apply the DroidSpaces defconfig fragment
+        working-directory: ${{ env.WS }}
+        run: |
+          set -euo pipefail
+          bash "$GITHUB_WORKSPACE/recipe/scripts/apply-droidspaces-config.sh" \
+            "$KERNEL_DIR/arch/arm64/configs/gki_defconfig"
+      - name: Neutralize check_defconfig on the GKI-side build config
+        working-directory: ${{ env.WS }}
+        run: |
+          set -euo pipefail
+          # For MODE=user, define_mgk() remaps build_variant to "ack", so the
+          # guard `gki_mixed_build or (build_variant != "ack")` in
+          # _mgk_build_config_impl is false and the generated GKI-side build
+          # config never overrides POST_DEFCONFIG_CMDS. build.config.gki's
+          # POST_DEFCONFIG_CMDS="check_defconfig" therefore survives and would
+          # fail the build, because `make savedefconfig` re-sorts our added
+          # symbols into Kconfig order and no longer matches the file byte for
+          # byte. MTK already blanks this for every other variant; do the same
+          # here so gki_defconfig stays editable.
+          f="$KERNEL_DIR/build.config.gki"
+          cp -f "$f" "$f.orig"
+          sed -i 's|^POST_DEFCONFIG_CMDS="check_defconfig"$|POST_DEFCONFIG_CMDS=""|' "$f"
+          grep -q '^POST_DEFCONFIG_CMDS=""$' "$f" \
+            || { echo "::error::failed to blank POST_DEFCONFIG_CMDS in $f"; cat "$f"; exit 1; }
+          diff -u "$f.orig" "$f" || true
+          rm -f "$f.orig"
+
+      - name: Build
+        working-directory: ${{ env.WS }}
+        env:
+          MODE: ${{ inputs.mode || 'user' }}
+          BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
+          DEFCONFIG_OVERLAYS: ${{ inputs.defconfig_overlays || 'mt6877_overlay.config' }}
+          SANDBOX_OFF: ${{ inputs.disable_sandbox && '1' || '' }}
+        run: |
+          set -euo pipefail
+
+          # "none" is the escape hatch for an empty overlay list: an empty
+          # workflow input would otherwise fall back to the default above.
+          [ "$DEFCONFIG_OVERLAYS" = "none" ] && DEFCONFIG_OVERLAYS=""
+
+          # These are read by key_value_repo() during WORKSPACE evaluation,
+          # i.e. before any target is analysed. They must be exported here,
+          # not inside a later Bazel invocation.
+          export KERNEL_VERSION DEFCONFIG_OVERLAYS
+          export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date -u +%s)}"
+          export PATH="$PWD/prebuilts/jdk/jdk11/linux-x86/bin:$PATH"
+
+          OUT_DIR="$PWD/out"
+          mkdir -p "$OUT_DIR"
+
+          startup=(
+            "--output_user_root=$OUT_DIR"
+            "--output_base=$OUT_DIR/bazel/output_user_root/output_base"
+          )
+          args=(
+            --experimental_writable_outputs
+            --noenable_bzlmod
+            # //build/bazel_mgk_rules:kernel_version defaults to 6.1; every
+            # select() on kernel_version_6.6 in mgk.bzl depends on this.
+            "--//build/bazel_mgk_rules:kernel_version=$KERNEL_VERSION_NUM"
+            --nokmi_symbol_list_violations_check
+          )
+          [ -n "$SANDBOX_OFF" ] && args+=(--config=local)
+
+          echo "MODE=$MODE  BUILD_SCOPE=$BUILD_SCOPE  DEFCONFIG_OVERLAYS=$DEFCONFIG_OVERLAYS"
+
+          if [ "$BUILD_SCOPE" = "dist" ]; then
+            # Full MediaTek build: GKI image + every in-tree and vendor module,
+            # collected into out/dist by copy_to_dist_dir.
+            target="//$DEVICE_MODULES_DIR:${PROJECT}_customer_modules_install.$MODE"
+            dist="//$DEVICE_MODULES_DIR:${PROJECT}_customer_dist.$MODE"
+            tools/bazel "${startup[@]}" build "${args[@]}" "$target"
+            tools/bazel "${startup[@]}" run   "${args[@]}" "$dist" -- --dist_dir="$OUT_DIR/dist"
+          else
+            # Kernel image only: the GKI-side kernel_build. Produces
+            # DEFAULT_GKI_OUTS (Image, Image.lz4, Image.gz, vmlinux, System.map,
+            # ...) plus the standard GKI in-tree modules via
+            # module_implicit_outs. Stock vendor_dlkm modules keep loading
+            # because the patch is padding-slot based.
+            target="//$DEVICE_MODULES_DIR:${PROJECT}_kernel_aarch64.$MODE"
+            tools/bazel "${startup[@]}" build "${args[@]}" "$target"
+          fi
+      - name: Collect kernel artifacts
+        working-directory: ${{ env.WS }}
+        env:
+          MODE: ${{ inputs.mode || 'user' }}
+          BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
+        run: |
+          set -euo pipefail
+          OUT_DIR="$PWD/out"
+          art="$PWD/artifacts"
+          mkdir -p "$art"
+
+          tgt="${PROJECT}_kernel_aarch64.$MODE"
+
+          # kernel_build declares its outs as
+          #   <target-name>/<out>  under bazel-bin/<package>/
+          # Prefer the dist directory (populated only for build_scope=dist),
+          # then the bazel-bin convenience symlink, then the execroot bin dirs
+          # (the symlink is not guaranteed once --output_base is overridden).
+          searchdirs=(
+            "$OUT_DIR/dist"
+            "$PWD/bazel-bin/$DEVICE_MODULES_DIR/$tgt"
+          )
+          while IFS= read -r d; do searchdirs+=("$d"); done < <(
+            find "$OUT_DIR/bazel/output_user_root/output_base/execroot" \
+              -maxdepth 5 -type d -name bin 2>/dev/null
+          )
+
+          srcdir=""
+          for cand in "${searchdirs[@]}"; do
+            [ -e "$cand" ] || continue
+            found="$(find -L "$cand" -maxdepth 4 -type f -name Image 2>/dev/null | head -1 || true)"
+            if [ -n "$found" ]; then srcdir="$(dirname "$found")"; break; fi
+          done
+          [ -n "$srcdir" ] || { echo "::error::no Image found; searched dist/, bazel-bin/ and the execroot"; exit 1; }
+          echo "Artifacts from: $srcdir"
+
+          for f in Image Image.lz4 Image.gz System.map vmlinux.symvers \
+                   modules.builtin modules.builtin.modinfo; do
+            [ -f "$srcdir/$f" ] && cp -f "$srcdir/$f" "$art/"
+          done
+          # vmlinux is ~500 MB uncompressed; keep it, but compressed.
+          if [ -f "$srcdir/vmlinux" ]; then
+            zstd -q -T0 -19 -o "$art/vmlinux.zst" "$srcdir/vmlinux" 2>/dev/null \
+              || zstd -q -T0 -o "$art/vmlinux.zst" "$srcdir/vmlinux"
+          fi
+          [ -f "$art/Image" ] || { echo "::error::Image missing after copy"; exit 1; }
+
+          if [ "$BUILD_SCOPE" = "dist" ]; then
+            mkdir -p "$art/modules"
+            # Vendor + in-tree modules, flattened, for manual inspection.
+            find -L "$OUT_DIR/dist" -type f -name '*.ko' -exec cp -f {} "$art/modules/" \; 2>/dev/null || true
+            echo "modules collected: $(ls -1 "$art/modules" 2>/dev/null | wc -l)"
+          fi
+
+          echo "SRCDIR=$srcdir" >> "$GITHUB_ENV"
+          echo "ART=$art" >> "$GITHUB_ENV"
+          echo "::group::artifacts"
+          ls -lh "$art"
+          echo "::endgroup::"
+
+      - name: Verify the built .config
+        working-directory: ${{ env.WS }}
+        env:
+          MODE: ${{ inputs.mode || 'user' }}
+        run: |
+          set -euo pipefail
+          OUT_DIR="$PWD/out"
+
+          cfg=""
+          # kernel_config rsyncs the resolved .config into its out_dir.
+          cfg="$(find -L "$OUT_DIR/bazel/output_user_root/output_base/execroot" \
+                   -path "*${PROJECT}_kernel_aarch64.${MODE}_config/out_dir/.config" \
+                   2>/dev/null | head -1 || true)"
+          if [ -z "$cfg" ] && [ -f "$SRCDIR/vmlinux" ]; then
+            # CONFIG_IKCONFIG=y in gki_defconfig, so the config is embedded in
+            # the image itself and can always be recovered.
+            "$KERNEL_DIR/scripts/extract-ikconfig" "$SRCDIR/vmlinux" > /tmp/built.config
+            cfg=/tmp/built.config
+          fi
+          [ -n "$cfg" ] || { echo "::error::could not locate the built .config"; exit 1; }
+          echo "Using .config: $cfg"
+          cp -f "$cfg" "$ART/build.config.resolved"
+
+          fail=0
+          echo "== DroidSpaces GKI-exclusive options =="
+          for s in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS \
+                   NETFILTER_XT_MATCH_ADDRTYPE USER_NS \
+                   NETFILTER_XT_TARGET_REJECT NETFILTER_XT_TARGET_LOG \
+                   NETFILTER_XT_MATCH_RECENT \
+                   IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET \
+                   TMPFS_POSIX_ACL TMPFS_XATTR; do
+            v="$(sed -n "s/^CONFIG_${s}=//p" "$cfg" | head -1)"
+            case "$v" in
+              y) printf '  ok    CONFIG_%s=y\n' "$s" ;;
+              m) printf '  ok    CONFIG_%s=m (module, loadable)\n' "$s" ;;
+              *) printf '  FAIL  CONFIG_%s not enabled\n' "$s"; fail=1 ;;
+            esac
+          done
+
+          echo "== DroidSpaces fatal-if-missing options =="
+          for s in NAMESPACES UTS_NS IPC_NS PID_NS CGROUP_DEVICE DEVTMPFS; do
+            if grep -qx "CONFIG_${s}=y" "$cfg"; then
+              printf '  ok    CONFIG_%s=y\n' "$s"
+            else
+              printf '  FAIL  CONFIG_%s missing (DroidSpaces check will refuse to run)\n' "$s"
+              fail=1
+            fi
+          done
+
+          echo "== recommended by the DroidSpaces runtime check =="
+          for s in EPOLL SIGNALFD BLK_DEV_LOOP EXT4_FS CGROUPS CGROUP_PIDS \
+                   CGROUP_SCHED MEMCG SECCOMP SECCOMP_FILTER OVERLAY_FS \
+                   FUSE_FS NET_NS BRIDGE VETH IPV6 KEYS; do
+            v="$(sed -n "s/^CONFIG_${s}=//p" "$cfg" | head -1)"
+            if [ -n "$v" ]; then
+              printf '  have   CONFIG_%s=%s\n' "$s" "$v"
+            else
+              printf '  MISS   CONFIG_%s (optional/recommended only)\n' "$s"
+            fi
+          done
+
+          echo "== kABI / module-loading guarantees =="
+          for s in MODVERSIONS MODULE_SIG_PROTECT; do
+            if grep -qx "CONFIG_${s}=y" "$cfg"; then
+              printf '  ok    CONFIG_%s=y\n' "$s"
+            else
+              printf '  WARN  CONFIG_%s not set - stock vendor modules may be rejected\n' "$s"
+            fi
+          done
+          grep -m1 '^CONFIG_LOCALVERSION=' "$cfg" || true
+
+          [ "$fail" -eq 0 ] || { echo "::error::the built .config does not satisfy DroidSpaces"; exit 1; }
+      - name: Package the AnyKernel3 zip
+        working-directory: ${{ env.WS }}
+        env:
+          MODE: ${{ inputs.mode || 'user' }}
+        run: |
+          set -euo pipefail
+          ak="$PWD/ak3"
+          rm -rf "$ak"
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 "$ak"
+          rm -rf "$ak/.git" "$ak/.github" "$ak/README.md" \
+                 "$ak/ramdisk" "$ak/patch" "$ak/modules"
+          # Recreate the placeholder dirs AK3 expects to exist.
+          mkdir -p "$ak/ramdisk" "$ak/patch" "$ak/modules"
+          touch "$ak/ramdisk/.gitkeep" "$ak/patch/.gitkeep" "$ak/modules/.gitkeep"
+
+          cp -f "$GITHUB_WORKSPACE/recipe/anykernel3/anykernel.sh" "$ak/anykernel.sh"
+
+          # ak3-core.sh flash_boot() picks the first match from a fixed list
+          # (zImage..., Image, ..., Image.gz, ..., Image.lz4). Ship the raw
+          # Image only, so there is no ambiguity about which one gets flashed.
+          cp -f "$ART/Image" "$ak/Image"
+
+          sver="$(sed -n 's/^CONFIG_LOCALVERSION="\(.*\)"$/\1/p' \
+                  "$KERNEL_DIR/arch/arm64/configs/gki_defconfig" | head -1)"
+          kver="$(sed -n 's/^VERSION = //p' "$KERNEL_DIR/Makefile" | head -1).$(sed -n 's/^PATCHLEVEL = //p' "$KERNEL_DIR/Makefile" | head -1).$(sed -n 's/^SUBLEVEL = //p' "$KERNEL_DIR/Makefile" | head -1)"
+          zipname="AK3-algiz-droidspaces-${kver}${sver}-${MODE}-$(date -u +%Y%m%d).zip"
+
+          ( cd "$ak" && zip -r9 "$ART/$zipname" . -x '.git*' >/dev/null )
+          echo "ZIPNAME=$zipname" >> "$GITHUB_ENV"
+          echo "KVER=${kver}${sver}" >> "$GITHUB_ENV"
+          ls -lh "$ART/$zipname"
+
+      - name: Repack boot.img (only when a stock boot.img is supplied)
+        working-directory: ${{ env.WS }}
+        env:
+          BOOT_IMG_URL: ${{ inputs.boot_img_url }}
+        run: |
+          set -euo pipefail
+          stock=""
+          if [ -f "$GITHUB_WORKSPACE/recipe/boot/boot.img" ]; then
+            stock="$GITHUB_WORKSPACE/recipe/boot/boot.img"
+            echo "Using committed boot/boot.img"
+          elif [ -n "${BOOT_IMG_URL:-}" ]; then
+            echo "Downloading stock boot.img"
+            curl -fsSL "$BOOT_IMG_URL" -o /tmp/stock-boot.img
+            stock=/tmp/stock-boot.img
+          else
+            echo "No stock boot.img supplied - skipping boot.img repack."
+            echo "Flash the AnyKernel3 zip instead, or re-run with boot_img_url set."
+            exit 0
+          fi
+
+          # Sanity check: Android boot images start with "ANDROID!".
+          magic="$(head -c 8 "$stock" | tr -d '\0')"
+          [ "$magic" = "ANDROID!" ] || {
+            echo "::error::$stock is not an Android boot image (magic: '$magic')"
+            exit 1
+          }
+
+          py="$PWD/prebuilts/build-tools/path/linux-x86/python3"
+          [ -x "$py" ] || py="$(command -v python3)"
+          work=/tmp/bootrepack
+          rm -rf "$work"; mkdir -p "$work/unpacked"
+
+          # unpack_bootimg --format=mkbootimg emits the exact argument list that
+          # reproduces the input, so the repack only differs by the kernel.
+          "$py" "$PWD/tools/mkbootimg/unpack_bootimg.py" \
+            --boot_img "$stock" --out "$work/unpacked" \
+            --format=mkbootimg -0 > "$work/args0"
+
+          echo "::group::stock boot.img layout"
+          "$py" "$PWD/tools/mkbootimg/unpack_bootimg.py" --boot_img "$stock" --format=info || true
+          echo "::endgroup::"
+
+          mapfile -d '' MKBOOTIMG_ARGS < "$work/args0"
+          # Drop the trailing empty element produced by the NUL delimiter.
+          [ -n "${MKBOOTIMG_ARGS[-1]:-}" ] || unset 'MKBOOTIMG_ARGS[-1]'
+
+          # Replace the --kernel payload with ours, keeping every other field.
+          cp -f "$ART/Image" "$work/Image"
+          for i in "${!MKBOOTIMG_ARGS[@]}"; do
+            if [ "${MKBOOTIMG_ARGS[$i]}" = "--kernel" ]; then
+              MKBOOTIMG_ARGS[$((i + 1))]="$work/Image"
+              break
+            fi
+          done
+
+          "$py" "$PWD/tools/mkbootimg/mkbootimg.py" \
+            "${MKBOOTIMG_ARGS[@]}" --output "$work/boot-new.img"
+
+          # Re-add the AVB hash footer if the stock image had one. The partition
+          # size must match the original file size exactly.
+          avb="$PWD/prebuilts/kernel-build-tools/linux-x86/bin/avbtool"
+          if [ -x "$avb" ] && "$avb" info_image --image "$stock" >/dev/null 2>&1; then
+            psize=$(stat -c %s "$stock")
+            newsize=$(stat -c %s "$work/boot-new.img")
+            if [ "$newsize" -gt "$psize" ]; then
+              echo "::error::repacked boot.img ($newsize B) exceeds the stock partition size ($psize B)"
+              exit 1
+            fi
+            "$avb" add_hash_footer --image "$work/boot-new.img" \
+              --partition_name boot --partition_size "$psize"
+            echo "AVB hash footer added (partition_size=$psize)"
+          else
+            echo "Stock image has no AVB footer (or avbtool unavailable) - leaving as is."
+          fi
+
+          cp -f "$work/boot-new.img" "$ART/boot.img"
+          ls -lh "$ART/boot.img"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: algiz-droidspaces-kernel-${{ inputs.mode || 'user' }}-${{ github.run_number }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            ${{ env.WS }}/artifacts/*.zip
+            ${{ env.WS }}/artifacts/boot.img
+            ${{ env.WS }}/artifacts/Image
+            ${{ env.WS }}/artifacts/Image.lz4
+            ${{ env.WS }}/artifacts/Image.gz
+            ${{ env.WS }}/artifacts/System.map
+            ${{ env.WS }}/artifacts/build.config.resolved
+            ${{ env.WS }}/artifacts/modules.builtin*
+
+      - name: Upload vmlinux and modules separately
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: algiz-droidspaces-debug-${{ inputs.mode || 'user' }}-${{ github.run_number }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ env.WS }}/artifacts/vmlinux.zst
+            ${{ env.WS }}/artifacts/vmlinux.symvers
+            ${{ env.WS }}/artifacts/modules/**
+
+      - name: Summary
+        if: always()
+        working-directory: ${{ env.WS }}
+        env:
+          MODE: ${{ inputs.mode || 'user' }}
+          BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
+        run: |
+          set -uo pipefail
+          {
+            echo "## Volla Quintus (algiz) DroidSpaces kernel"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Kernel | \`${KVER:-unknown}\` |"
+            echo "| Variant | \`$MODE\` |"
+            echo "| Scope | \`$BUILD_SCOPE\` |"
+            echo "| AK3 zip | \`${ZIPNAME:-not built}\` |"
+            if [ -f artifacts/boot.img ]; then
+              echo "| boot.img | repacked from your stock image |"
+            else
+              echo "| boot.img | not built (no stock boot.img supplied) |"
+            fi
+            echo
+            echo "### Flashing"
+            echo
+            echo '1. Root first with Magisk or APatch (this kernel contains no root solution).'
+            echo '2. Flash the AnyKernel3 zip from a custom recovery or via the Magisk app.'
+            echo '   It replaces only the kernel image and keeps your existing ramdisk, so'
+            echo '   an already-patched Magisk boot image stays patched.'
+            echo '3. Open DroidSpaces, enable **Daemon Mode**, and reboot.'
+            echo
+            echo "### Artifacts"
+            echo '```'
+            ls -lh artifacts 2>/dev/null || echo "(none)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Disk usage (diagnostics)
+        if: always()
+        run: df -h / /mnt || true
+

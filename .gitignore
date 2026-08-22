@@ -1,0 +1,16 @@
+# Local research scratch: raw copies of upstream build files, fetched while
+# working out the build. Not part of the deliverable.
+/.research/
+
+# Backups written by scripts/apply-droidspaces-config.sh
+*.droidspaces.bak
+
+# A synced kernel workspace should never end up inside this repo.
+/kernel-6.6/
+/kernel_device_modules-6.6/
+/out/
+/artifacts/
+/ak3/
+
+# Local Claude Code tool-permission state, not project content.
+/.claude/
