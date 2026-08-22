@@ -42,8 +42,11 @@ boot, that image is how you get your phone back.
 
 ## After flashing
 
-1. Root with **Magisk** or **APatch** — this kernel contains **no** in-kernel
-   root (no KernelSU / KernelSU-Next / SukiSU) by design.
+1. Root with **Magisk**, **APatch** or **KernelSU in LKM mode** — this kernel
+   contains **no** in-kernel root (no KernelSU / KernelSU-Next / SukiSU) by
+   design. KernelSU LKM works because \`KPROBES\`, \`KALLSYMS_ALL\`, \`MODULES\`
+   and \`MODULE_UNLOAD\` are \`=y\` and \`MODULE_SIG_FORCE\` is off; its patch
+   lives in \`init_boot\`, which neither artifact here touches.
 2. Reboot, open DroidSpaces, enable **Daemon Mode**, reboot again. Without
    Daemon Mode, DroidSpaces cannot hold the root session it needs and
    containers will not start.
@@ -99,8 +102,19 @@ that stock vendor modules' vermagic is matched against.
 | \`SHA256SUMS\` | Checksums for everything above |
 
 A \`boot.img\` is attached only when a stock one was supplied to the build —
-commit \`boot/boot.img\` or pass the \`boot_img_url\` input. Note a repacked
-image contains no Magisk patch.
+commit \`boot/boot.img\` or pass the \`boot_img_url\` input. It is repacked from
+your stock image with only the kernel payload swapped, then given a fresh AVB
+hash footer with algorithm \`NONE\` — re-signing would need Volla's private AVB
+key. Flash it with \`fastboot flash boot boot.img\`; an unlocked bootloader is
+required either way.
+
+**If you are rooted with KernelSU in LKM mode, do not touch \`init_boot\`.**
+KernelSU's LKM patch lives in the \`init_boot\` partition (ramdisk only,
+\`kernel_size: 0\`), while this kernel replaces the \`boot\` partition (kernel
+only, \`ramdisk_size: 0\`). They are different partitions, so flashing this
+\`boot.img\` leaves your KernelSU patch in place and there is nothing to restore
+first. The AnyKernel3 zip is the same story — it only runs
+\`split_boot; flash_boot;\`, and never opens \`init_boot\`.
 
 Built by [run #${RUN}](${RUN_URL}).
 EOF

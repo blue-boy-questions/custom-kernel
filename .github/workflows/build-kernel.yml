@@ -566,35 +566,69 @@ jobs:
           "$py" "$PWD/tools/mkbootimg/unpack_bootimg.py" --boot_img "$stock" --format=info || true
           echo "::endgroup::"
 
+          # mapfile -d '' treats the NUL as a *terminator*, not a separator, so a
+          # stream of N NUL-terminated arguments yields exactly N elements. There
+          # is no trailing empty element to drop, and dropping one anyway is what
+          # broke the first attempt at this step: for header_version >= 3,
+          # unpack_bootimg emits --cmdline *last*, algiz's stock cmdline is empty,
+          # so the "cleanup" deleted that legitimately-empty value and left
+          # mkbootimg with a dangling --cmdline ("expected one argument").
           mapfile -d '' MKBOOTIMG_ARGS < "$work/args0"
-          # Drop the trailing empty element produced by the NUL delimiter.
-          [ -n "${MKBOOTIMG_ARGS[-1]:-}" ] || unset 'MKBOOTIMG_ARGS[-1]'
+          printf 'unpack_bootimg emitted %d argument(s):\n' "${#MKBOOTIMG_ARGS[@]}"
+          printf '  [%s]\n' "${MKBOOTIMG_ARGS[@]}"
+
+          # Match the stock image's kernel container. algiz ships a gzip-compressed
+          # kernel (byte 0x1000 of the stock boot.img is 1f 8b 08, 14554925 B). A
+          # raw 36 MB Image also boots, but it leaves far less slack inside the
+          # 40 MB boot partition once avbtool pads to partition_size below.
+          if [ -f "$ART/Image.gz" ]; then
+            payload="$ART/Image.gz"
+          else
+            payload="$ART/Image"
+          fi
+          cp -f "$payload" "$work/kernel-payload"
+          echo "kernel payload: ${payload##*/} ($(stat -c %s "$work/kernel-payload") bytes)"
 
           # Replace the --kernel payload with ours, keeping every other field.
-          cp -f "$ART/Image" "$work/Image"
+          replaced=0
           for i in "${!MKBOOTIMG_ARGS[@]}"; do
             if [ "${MKBOOTIMG_ARGS[$i]}" = "--kernel" ]; then
-              MKBOOTIMG_ARGS[$((i + 1))]="$work/Image"
+              MKBOOTIMG_ARGS[$((i + 1))]="$work/kernel-payload"
+              replaced=1
               break
             fi
           done
+          [ "$replaced" -eq 1 ] || {
+            echo "::error::unpack_bootimg emitted no --kernel argument"
+            exit 1
+          }
 
           "$py" "$PWD/tools/mkbootimg/mkbootimg.py" \
             "${MKBOOTIMG_ARGS[@]}" --output "$work/boot-new.img"
 
-          # Re-add the AVB hash footer if the stock image had one. The partition
-          # size must match the original file size exactly.
+          # Re-add the AVB hash footer if the stock image had one. avbtool needs
+          # room for the footer and vbmeta blob on top of the payload, so compare
+          # against --calc_max_image_size rather than the raw partition size.
+          #
+          # The footer is written with algorithm NONE: re-signing would need the
+          # OEM's private AVB key, which nobody outside Volla has. The stock image
+          # carries a SHA256_RSA2048 signature; the repack cannot. That is fine on
+          # an unlocked bootloader (which flashing a custom kernel already
+          # requires) but the image will not pass locked-bootloader verification.
           avb="$PWD/prebuilts/kernel-build-tools/linux-x86/bin/avbtool"
           if [ -x "$avb" ] && "$avb" info_image --image "$stock" >/dev/null 2>&1; then
             psize=$(stat -c %s "$stock")
+            maxsize=$("$avb" add_hash_footer --partition_name boot \
+                        --partition_size "$psize" --calc_max_image_size)
             newsize=$(stat -c %s "$work/boot-new.img")
-            if [ "$newsize" -gt "$psize" ]; then
-              echo "::error::repacked boot.img ($newsize B) exceeds the stock partition size ($psize B)"
+            echo "repacked $newsize B; max payload $maxsize B; partition $psize B"
+            if [ "$newsize" -gt "$maxsize" ]; then
+              echo "::error::repacked boot.img ($newsize B) does not fit the boot partition (max payload $maxsize B of $psize B)"
               exit 1
             fi
             "$avb" add_hash_footer --image "$work/boot-new.img" \
               --partition_name boot --partition_size "$psize"
-            echo "AVB hash footer added (partition_size=$psize)"
+            echo "AVB hash footer added (partition_size=$psize, unsigned)"
           else
             echo "Stock image has no AVB footer (or avbtool unavailable) - leaving as is."
           fi

@@ -42,3 +42,12 @@ running the workflow. A committed `boot/boot.img` takes precedence over the URL.
 Note that a repacked `boot.img` contains **no** Magisk patch; re-patch it with
 Magisk afterwards, or just flash the AnyKernel3 zip instead (that path preserves
 an existing Magisk patch).
+
+**KernelSU in LKM mode is unaffected either way.** Its patch is in the
+`init_boot` partition (ramdisk only, `kernel_size: 0`), not `boot` (kernel only,
+`ramdisk_size: 0`) — so you do not restore stock `init_boot` before flashing a
+new `boot.img`, and doing so would only remove your root.
+
+The repacked image is given a fresh AVB hash footer with algorithm `NONE`,
+because re-signing needs Volla's private AVB key. It therefore only boots with
+an unlocked bootloader, which flashing a custom kernel requires anyway.
