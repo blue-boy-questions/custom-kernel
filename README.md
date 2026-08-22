@@ -165,6 +165,18 @@ root solution, DroidSpaces is expected to misbehave; use a plain build.
   6.6.89. `_6_7_8` is the variant this kernel uses (slots 6/7/8 are the free
   ones here); `_3_4_5` is a working fallback. `patch` is invoked with default
   fuzz on purpose: hunk 1 lands at offset −2 and hunk 2 at offset +8.
+- **The two upstream trees are out of sync, and the workflow fixes it.**
+  `kernel_device_modules-6.6` @ `volla-16.0` still passes
+  `dtb_files = ["mt6899.dtb"]` to `define_mgk()` — a different SoC — but
+  `build/bazel_mgk_rules` @ `volla-16.0-algiz` removed DTB handling entirely:
+  its `define_mgk()` signature ends at `symbol_list`, with no `dtb`/`dtstree`
+  code left to consume the argument. Bazel fails analysis with
+  `define_mgk() got unexpected keyword argument: dtb_files` and never declares
+  `mgk_64_k66_kernel_aarch64.<mode>`. A dedicated step diffs the call site
+  against the signature and drops any kwarg the signature does not accept. The
+  `ansuz` branches still carry `dtb_files = None` in the signature, which
+  confirms `BUILD.bazel` is the stale side. The step no-ops once HelloVolla
+  fixes it, and refuses to guess at any stale kwarg other than `dtb_files`.
 - **`check_defconfig` is disabled** for the GKI-side build. For `MODE=user`,
   `define_mgk()` remaps the build variant to `ack`, which makes
   `_mgk_build_config_impl` skip its `POST_DEFCONFIG_CMDS=""` line, so

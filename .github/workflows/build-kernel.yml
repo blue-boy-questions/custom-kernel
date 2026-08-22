@@ -209,6 +209,65 @@ jobs:
           diff -u "$f.orig" "$f" || true
           rm -f "$f.orig"
 
+      - name: Reconcile the define_mgk() call with the algiz mgk.bzl signature
+        working-directory: ${{ env.WS }}
+        run: |
+          set -euo pipefail
+          # kernel_device_modules-6.6 @ volla-16.0 is out of sync with
+          # build/bazel_mgk_rules @ volla-16.0-algiz: BUILD.bazel still passes
+          # `dtb_files = ["mt6899.dtb"]` (a different SoC), but the algiz
+          # mgk.bzl dropped DTB handling entirely - define_mgk() ends at
+          # symbol_list and there is no dtb/dtstree code path left to consume
+          # it. Bazel therefore fails analysis with
+          #   define_mgk() got unexpected keyword argument: dtb_files
+          # and never declares mgk_64_k66_kernel_aarch64.<mode>.
+          # The ansuz branches keep `dtb_files = None` in the signature, which
+          # confirms BUILD.bazel is the stale side here.
+          mgk="build/bazel_mgk_rules/mgk.bzl"
+          f="$DEVICE_MODULES_DIR/BUILD.bazel"
+
+          sig() {
+            awk '/^def define_mgk\(/{f=1} f{print} f && /\):[[:space:]]*$/{exit}' "$mgk" \
+              | sed -n 's/^[[:space:]]*\([a-z_][a-z_0-9]*\)[[:space:]]*[,=:)].*/\1/p' \
+              | sort -u
+          }
+          kwargs() {
+            awk '/^define_mgk\(/{f=1;next} /^\)/{f=0} f' "$f" \
+              | sed -n 's/^[[:space:]]*\([a-z_][a-z_0-9]*\)[[:space:]]*=.*/\1/p' \
+              | sort -u
+          }
+
+          sig > /tmp/mgk.sig
+          kwargs > /tmp/mgk.kw
+          echo "define_mgk() accepts $(wc -l < /tmp/mgk.sig) params; call passes $(wc -l < /tmp/mgk.kw) kwargs"
+
+          extra="$(comm -23 /tmp/mgk.kw /tmp/mgk.sig || true)"
+          if [ -z "$extra" ]; then
+            echo "No stale kwargs - the trees agree, nothing to do."
+            exit 0
+          fi
+          echo "Stale kwargs in $f:"; printf '  %s\n' $extra
+
+          # Only single-line `name = value,` kwargs can be removed safely.
+          for k in $extra; do
+            case "$k" in
+              dtb_files) ;;
+              *) echo "::error::unexpected stale kwarg '$k' - refusing to guess; inspect $f"; exit 1 ;;
+            esac
+            n="$(grep -c "^[[:space:]]*${k}[[:space:]]*=.*,[[:space:]]*$" "$f" || true)"
+            [ "$n" = "1" ] || { echo "::error::'$k' is not a single-line kwarg ($n matches)"; exit 1; }
+            grep -n "^[[:space:]]*${k}[[:space:]]*=" "$f"
+            sed -i "/^[[:space:]]*${k}[[:space:]]*=.*,[[:space:]]*$/d" "$f"
+            echo "removed: $k"
+          done
+
+          # The call must still be well formed and free of unknown kwargs.
+          kwargs > /tmp/mgk.kw2
+          left="$(comm -23 /tmp/mgk.kw2 /tmp/mgk.sig || true)"
+          [ -z "$left" ] || { echo "::error::stale kwargs remain: $left"; exit 1; }
+          tail -4 "$f"
+          grep -q '^)' "$f" || { echo "::error::define_mgk() call is no longer closed"; exit 1; }
+
       - name: Build
         working-directory: ${{ env.WS }}
         env:
