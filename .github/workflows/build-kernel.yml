@@ -34,6 +34,10 @@ on:
         description: "Add --config=local (disables the Bazel sandbox). Only needed if you hit sandbox errors."
         type: boolean
         default: false
+      publish_release:
+        description: "Publish a GitHub release with the AK3 zip and kernel images attached. Manual runs only; push-triggered runs never release."
+        type: boolean
+        default: true
   push:
     paths:
       - ".github/workflows/build-kernel.yml"
@@ -43,7 +47,9 @@ on:
       - "anykernel3/**"
 
 permissions:
-  contents: read
+  # write is needed only by the "Publish release" step (gh release create/upload).
+  # Nothing else in this workflow writes to the repository.
+  contents: write
 
 env:
   KERNEL_DIR: kernel-6.6
@@ -617,6 +623,58 @@ jobs:
             ${{ env.WS }}/artifacts/vmlinux.symvers
             ${{ env.WS }}/artifacts/modules/**
 
+      - name: Publish release
+        # Manual runs only. The push trigger fires on any change under
+        # scripts/**, patches/**, anykernel3/** or this file, and turning those
+        # into public releases would be noise.
+        if: success() && github.event_name == 'workflow_dispatch' && inputs.publish_release
+        working-directory: ${{ env.WS }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MODE: ${{ inputs.mode || 'user' }}
+          BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
+        run: |
+          set -euo pipefail
+          cd "$ART"
+
+          # gh needs a concrete tag. KVER/ZIPNAME come from the packaging step's
+          # $GITHUB_ENV exports, so the tag can never disagree with the zip.
+          # The run number keeps two builds on the same day from colliding.
+          tag="v${KVER}-droidspaces-${GITHUB_RUN_NUMBER}"
+
+          # Build the asset list from what actually exists: boot.img is
+          # conditional, and a `dist` build produces a different module set.
+          # Naming a missing file would abort the step under `set -e`.
+          assets=()
+          for f in *.zip Image Image.lz4 Image.gz System.map \
+                   build.config.resolved modules.builtin modules.builtin.modinfo \
+                   boot.img; do
+            [ -f "$f" ] && assets+=("$f")
+          done
+          [ "${#assets[@]}" -gt 0 ] || { echo "::error::no artifacts to release"; exit 1; }
+
+          sha256sum -- "${assets[@]}" > SHA256SUMS
+          assets+=(SHA256SUMS)
+          cat SHA256SUMS
+          echo "attaching ${#assets[@]} assets"
+
+          "$GITHUB_WORKSPACE/recipe/scripts/release-notes.sh" \
+            "$KVER" "$ZIPNAME" "$MODE" "$BUILD_SCOPE" "$GITHUB_RUN_NUMBER" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            > /tmp/notes.md
+
+          gh release create "$tag" \
+            --title "algiz DroidSpaces kernel ${KVER} (build ${GITHUB_RUN_NUMBER})" \
+            --notes-file /tmp/notes.md \
+            --target "$GITHUB_SHA" \
+            "${assets[@]}"
+
+          url="$(gh release view "$tag" --json url --jq .url)"
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "RELEASE_URL=$url" >> "$GITHUB_ENV"
+          echo "published $url"
+
       - name: Summary
         if: always()
         working-directory: ${{ env.WS }}
@@ -638,6 +696,9 @@ jobs:
               echo "| boot.img | repacked from your stock image |"
             else
               echo "| boot.img | not built (no stock boot.img supplied) |"
+            fi
+            if [ -n "${RELEASE_URL:-}" ]; then
+              echo "| Release | [\`${RELEASE_TAG}\`](${RELEASE_URL}) |"
             fi
             echo
             echo "### Flashing"

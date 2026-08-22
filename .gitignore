@@ -14,3 +14,12 @@
 
 # Local Claude Code tool-permission state, not project content.
 /.claude/
+
+# Stock partition images dumped from the phone and left in the project root.
+# These are vendor binaries, ~125 MB in total, and have no business in a public
+# git history. Note this deliberately does NOT cover boot/boot.img, which is the
+# supported way to hand a stock boot image to the workflow.
+/boot.img
+/init_boot.img
+/vendor_boot.img
+/dtbo.img
