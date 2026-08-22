@@ -1,8 +1,26 @@
 # Optional: your stock boot.img
 
-Drop your **stock** (unmodified) `boot.img` here as `boot/boot.img` if you want
-the workflow to emit a fastboot-flashable, repacked `boot.img` in addition to the
-AnyKernel3 zip.
+**For `algiz`, this is already done — you do not need to put anything here.** The
+stock image is attached to the
+[`stock-images-algiz`](https://github.com/blue-boy-questions/custom-kernel/releases/tag/stock-images-algiz)
+release; pass that asset's download URL as the workflow's `boot_img_url` input and
+the run will emit a repacked, fastboot-flashable `boot.img` alongside the
+AnyKernel3 zip:
+
+```
+https://github.com/blue-boy-questions/custom-kernel/releases/download/stock-images-algiz/boot.img
+```
+
+sha256 `227e34c2798893a0743da64b4ed44413b9cfda6501087596af99b781625d2720`, 41943040
+bytes, kernel `6.6.89-android15-8-gbe8d201b0d27-ab13762941-4k`, no Magisk patch.
+
+Keeping it as a release asset rather than a committed file keeps 40 MB of vendor
+binary out of the git history, where it could not be removed without a rewrite.
+
+---
+
+Drop your **stock** (unmodified) `boot.img` here as `boot/boot.img` instead if you
+prefer it to be automatic for every run, including push-triggered ones.
 
 How to get it:
 
