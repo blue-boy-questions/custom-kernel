@@ -1,16 +1,23 @@
-# Volla Phone Quintus (`algiz`) — DroidSpaces-ready Linux 6.6 kernel
+# Volla Phone Quintus (`algiz`) — custom Linux 6.6 kernels
 
 Builds HelloVolla's MediaTek MT6877 kernel (**6.6.89**, Volla OS 16 / Android 16)
-from source in GitHub Actions, patched so that
-[DroidSpaces-OSS](https://github.com/ravindu644/Droidspaces-OSS) works, and
-packages the result as an AnyKernel3 zip plus (optionally) a repacked `boot.img`.
+from source in GitHub Actions and publishes **three variants side by side in one
+release**, each as an AnyKernel3 zip plus (optionally) a repacked `boot.img`.
 
-Nothing else is changed. **No root solution is compiled into this kernel** — see
-[Rooting](#rooting) below.
+| Variant | DroidSpaces config | SELinux | Use it when |
+|---|---|---|---|
+| `droidspaces-enforcing` | yes | **enforcing** (stock) | **Start here.** You want [DroidSpaces](https://github.com/ravindu644/Droidspaces-OSS) and your phone's security model unchanged. |
+| `droidspaces-permissive` | yes | permanently permissive | Something inside a container is blocked and `dmesg` shows `avc: denied`. |
+| `stock-permissive` | no — stock `gki_defconfig` | permanently permissive | You do not use DroidSpaces and only want a permissive kernel. |
+
+Flash exactly **one** of them. Nothing else about the kernel is changed, and
+**no root solution is compiled into any variant** — see [Rooting](#rooting).
 
 ---
 
 ## What this actually does
+
+### The DroidSpaces variants
 
 DroidSpaces needs Linux namespaces and IPC features that Android's GKI
 `gki_defconfig` ships disabled. Two changes are required, and only two:
@@ -44,8 +51,55 @@ DroidSpaces needs Linux namespaces and IPC features that Android's GKI
    Under `__GENKSYMS__` the macros expand back to the original reserve slots, so
    symbol CRCs — and therefore the KMI — are unchanged.
 
-Because the layout is preserved, only the **kernel image** has to be rebuilt.
-The stock vendor modules keep loading:
+`stock-permissive` applies neither: it leaves `gki_defconfig` byte-identical and
+`task_struct` exactly as shipped.
+
+### The permissive variants
+
+`enforcing_enabled()` in `security/selinux/include/security.h` is the single
+predicate every SELinux enforcement decision passes through — in Linux 6.6 there
+are exactly five readers (`avc_denied()`, the unrecognized-netlink fallback in
+`hooks.c`, and three in `ss/services.c`), plus `selinuxfs.c` which only *reports*
+the value. [patches/002.selinux-permanently-permissive.patch](patches/002.selinux-permanently-permissive.patch)
+changes that one `static inline` to `return false;`:
+
+```c
+ #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
+ static inline bool enforcing_enabled(void)
+ {
+-	return READ_ONCE(selinux_state.enforcing);
++	return false;
+ }
+```
+
+So the whole LSM logs and allows, without touching a single hook, struct or
+exported symbol — **kABI neutral by construction**, and invisible in `.config`.
+
+**This is not `selinux=0`.** `selinuxfs` is still registered and the policy is
+still loaded, both of which Android 16's init requires in order to boot at all.
+`selinux=0` was considered and rejected: `CONFIG_SECURITY_SELINUX_BOOTPARAM` is
+`default n` and absent from the stock defconfig, and with the parameter set
+`selinuxfs` is never registered, which would almost certainly bootloop.
+
+`enforcing_set()` is deliberately **not** patched, so `selinux_state.enforcing`
+is still written and `/sys/fs/selinux/enforce` stays writable. On a permissive
+kernel:
+
+| | |
+|---|---|
+| `getenforce` | `Permissive`, always, from the first instruction |
+| `setenforce 1` | succeeds, and has no effect |
+| `/sys/fs/selinux/` | present |
+| denials | logged and allowed |
+
+A permissive kernel removes a real security boundary for **every** app on the
+device, not just for containers. Prefer `droidspaces-enforcing` unless an
+enforcing kernel has actually got in your way.
+
+### Why only the kernel image is rebuilt
+
+Because the layout is preserved in all three variants, the stock vendor modules
+keep loading:
 
 - `CONFIG_MODVERSIONS=y` → `same_magic()` in `kernel/module/version.c` skips the
   leading release-string token of vermagic when CRCs are present, so the module's
@@ -62,51 +116,72 @@ multi-hour MediaTek `dist` build.
 
 | Path | Purpose |
 |---|---|
-| [.github/workflows/build-kernel.yml](.github/workflows/build-kernel.yml) | The whole build. Run it from the Actions tab. |
+| [.github/workflows/build-kernel.yml](.github/workflows/build-kernel.yml) | The whole build: a `plan` job computing the variant matrix, a matrixed `build` job, and a `release` job that cuts one release. Run it from the Actions tab. |
 | [local_manifests/algiz.xml](local_manifests/algiz.xml) | `repo` local manifest overlaying the five HelloVolla trees onto AOSP `common-android15-6.6`. |
 | [scripts/setup-workspace.sh](scripts/setup-workspace.sh) | `repo init` / `repo sync` + a layout sanity check. |
-| [scripts/apply-droidspaces-config.sh](scripts/apply-droidspaces-config.sh) | Idempotent, per-symbol `gki_defconfig` editor. Verifies afterwards. |
-| [scripts/release-notes.sh](scripts/release-notes.sh) | Generates the GitHub release body. |
-| [patches/](patches/) | The three upstream SYSVIPC kABI patch variants. |
-| [anykernel3/anykernel.sh](anykernel3/anykernel.sh) | AnyKernel3 config for `algiz` (kernel-image-only flash). |
-| [boot/](boot/README.md) | **Optional, you add this.** Drop your stock `boot.img` here to also get a repacked, fastboot-flashable image. |
+| [scripts/apply-droidspaces-config.sh](scripts/apply-droidspaces-config.sh) | Idempotent, per-symbol `gki_defconfig` editor. Verifies afterwards. DroidSpaces variants only. |
+| [scripts/release-notes.sh](scripts/release-notes.sh) | Generates the GitHub release body from the variants that actually built. |
+| [patches/](patches/) | The three upstream SYSVIPC kABI patch variants, plus the permissive-SELinux patch. |
+| [anykernel3/anykernel.sh](anykernel3/anykernel.sh) | AnyKernel3 config for `algiz` (kernel-image-only flash). `kernel.string` is rewritten per variant at package time. |
+| [boot/](boot/README.md) | **Optional, you add this.** Supply your stock `boot.img` to also get repacked, fastboot-flashable images. |
 
 ---
 
 ## Building
 
-Actions → **Build algiz DroidSpaces kernel** → *Run workflow*.
+Actions → **Build algiz kernels** → *Run workflow*.
 
 | Input | Default | Meaning |
 |---|---|---|
-| `build_scope` | `image` | `image` builds only the GKI-side `Image`/`Image.lz4`/`Image.gz` + in-tree modules (~40–70 min). `dist` runs the full MediaTek build with every vendor module (several hours, and you do not need it). |
+| `variants` | `all` | Build all three, or just one of `droidspaces-enforcing` / `droidspaces-permissive` / `stock-permissive`. |
+| `build_scope` | `image` | `image` builds only the GKI-side `Image`/`Image.lz4`/`Image.gz` + in-tree modules (~40–70 min per variant). `dist` runs the full MediaTek build with every vendor module (several hours, and you do not need it). |
 | `mode` | `user` | MTK build variant. `userdebug`/`eng` pull in `userdebug.config`/`eng.config`, which set `MTK_PANIC_ON_WARN`, `DEBUG_KMEMLEAK` and ~80 more debug symbols. Do not daily-drive those. |
 | `defconfig_overlays` | `mt6877_overlay.config` | `DEFCONFIG_OVERLAYS`, space separated. Pass the literal `none` for an empty list. |
 | `boot_img_url` | *(empty)* | Direct download URL of your **stock** `boot.img`. For `algiz` there is one attached to the [`stock-images-algiz`](https://github.com/blue-boy-questions/custom-kernel/releases/tag/stock-images-algiz) release. Alternatively commit it as `boot/boot.img`. |
 | `disable_sandbox` | off | Adds `--config=local`. Only if you hit Bazel sandbox errors. |
-| `publish_release` | on | Publish a GitHub release with the zip and images attached. Manual runs only — push-triggered runs never release. |
+| `publish_release` | on | Publish one GitHub release with every variant attached. Manual runs only — push-triggered runs never release. |
 
-Artifacts: the AnyKernel3 zip, `Image`, `Image.lz4`, `Image.gz`, `System.map`,
-the resolved `.config` and — when you supplied a stock image — `boot.img`.
-`vmlinux` and the module set are uploaded as a separate, shorter-retention
-artifact.
+The three variants build **in parallel**, one runner each, with `fail-fast`
+off: a variant that fails does not cancel or block the others, and the release
+job still publishes whatever did build (with a warning saying so).
 
-Every run ends with a verification step that reads the **built** `.config` (not
-the defconfig) and fails if any required DroidSpaces option is missing. It also
-prints the recommended-but-optional ones, and confirms `MODVERSIONS` /
-`MODULE_SIG_PROTECT` are still set.
+Artifacts are one set per variant (`algiz-kernel-<run>-<variant>`): the
+AnyKernel3 zip, `Image`, `Image.lz4`, `Image.gz`, `System.map`, the resolved
+`.config`, a small `variant.json` describing the build, and — when you supplied
+a stock image — `boot.img`. `vmlinux` and the module set go to a separate,
+shorter-retention artifact and are **not** released.
+
+Each variant verifies its own **built** `.config` (not the defconfig) before its
+artifacts are uploaded:
+
+- DroidSpaces variants fail if any required DroidSpaces symbol is missing. That
+  check is skipped for `stock-permissive`, where several of those symbols are
+  legitimately absent.
+- Permissive variants fail if `CONFIG_SECURITY_SELINUX_DEVELOP` is not `=y`,
+  because the patched branch would then be dead code and the kernel would come
+  out silently enforcing. The patch step itself also asserts, at source level,
+  that `enforcing_enabled()` now returns `false` **and** that `enforcing_set()`
+  still writes `selinux_state.enforcing`.
+- Every variant reports the KernelSU-LKM prerequisites (`KPROBES`,
+  `KALLSYMS_ALL`, `MODULES`, `MODULE_UNLOAD`, `MODULE_SIG_FORCE`) and confirms
+  `MODVERSIONS` / `MODULE_SIG_PROTECT` are still set.
 
 ### Releases
 
-A successful **manual** run publishes a GitHub release tagged
-`v<kernel>-droidspaces-<run number>` with the AnyKernel3 zip, all three kernel
-images, `System.map`, the resolved `.config`, `SHA256SUMS` and — when you
-supplied one — `boot.img`. Unlike Actions artifacts, these do not expire and
-need no login to download. Set `publish_release` to off to skip it.
+A successful **manual** run publishes **one** GitHub release tagged
+`v<kernel>-<run number>` containing every variant that built. Assets are
+prefixed with the variant they came from — `droidspaces-enforcing-Image`,
+`stock-permissive-boot.img`, and so on — except the AnyKernel3 zips, which
+already carry the variant in their filename. `SHA256SUMS` covers all of them,
+and a follow-up step fails the job if any asset is left in GitHub's `starter`
+state (a truncated upload, which never heals). Unlike Actions artifacts, release
+assets do not expire and need no login to download. Set `publish_release` to off
+to skip it.
 
 Push-triggered runs never publish a release; they only upload Actions artifacts
-(30 days for the kernel set, 7 for `vmlinux` and the modules). The release body
-is generated by [scripts/release-notes.sh](scripts/release-notes.sh).
+(30 days for the kernel sets, 7 for `vmlinux` and the modules). The release body
+is generated by [scripts/release-notes.sh](scripts/release-notes.sh), which is
+given the list of variants that built so it never advertises a missing asset.
 
 The [`stock-images-algiz`](https://github.com/blue-boy-questions/custom-kernel/releases/tag/stock-images-algiz)
 release is not a build — it holds the **stock** `algiz` `boot.img`
@@ -127,16 +202,21 @@ builds are equivalent.
 ```bash
 scripts/setup-workspace.sh ~/algiz local_manifests/algiz.xml
 cd ~/algiz
+# DroidSpaces variants only:
 patch -p1 -d kernel-6.6 < /path/to/patches/001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch
 /path/to/scripts/apply-droidspaces-config.sh kernel-6.6/arch/arm64/configs/gki_defconfig
 sed -i 's|^POST_DEFCONFIG_CMDS="check_defconfig"$|POST_DEFCONFIG_CMDS=""|' kernel-6.6/build.config.gki
+# Permissive variants only:
+patch -p1 -d kernel-6.6 < /path/to/patches/002.selinux-permanently-permissive.patch
 export KERNEL_VERSION=kernel-6.6 DEFCONFIG_OVERLAYS=mt6877_overlay.config KLEAF_GKI_CHECKER=no
 tools/bazel build --noenable_bzlmod --experimental_writable_outputs \
   --//build/bazel_mgk_rules:kernel_version=6.6 --nokmi_symbol_list_violations_check \
   //kernel_device_modules-6.6:mgk_64_k66_kernel_aarch64.user
 ```
 
-Roughly 60 GB of disk and 16 GB of RAM.
+Roughly 60 GB of disk and 16 GB of RAM. For a stock-config build, skip the
+`apply-droidspaces-config.sh`, `001.*` patch and `check_defconfig` lines — with
+`gki_defconfig` unedited, `check_defconfig` passes on its own.
 
 ---
 
@@ -144,11 +224,13 @@ Roughly 60 GB of disk and 16 GB of RAM.
 
 1. **Back up your stock `boot.img` first.** If the kernel does not boot, that
    image is how you get your phone back.
-2. Root the phone with Magisk or APatch **before** flashing this kernel (see
-   below).
-3. Flash `AK3-algiz-droidspaces-*.zip` from a custom recovery, or via the Magisk
-   app's *Modules → Install from storage*.
-4. Reboot, open DroidSpaces, enable **Daemon Mode**, reboot again.
+2. Set up root if you want it — see [Rooting](#rooting). The order does not
+   matter, because root and this kernel live in different partitions.
+3. Flash **one** `AK3-algiz-<variant>-*.zip` from a custom recovery, or via the
+   Magisk app's *Modules → Install from storage*. The zip prints which variant
+   it is while installing.
+4. Reboot. For a DroidSpaces variant: open DroidSpaces, enable **Daemon Mode**,
+   reboot again.
 
 The AnyKernel3 script runs `split_boot; flash_boot;` — the plain "OG AK" flow. It
 replaces **only** the kernel image and leaves your ramdisk exactly as it is, so
@@ -157,29 +239,79 @@ and re-applies the kernel-side patch on repack). `BLOCK=auto` and
 `IS_SLOT_DEVICE=auto` handle the A/B slot suffix.
 
 If you prefer `fastboot`, supply your stock `boot.img` to the workflow and flash
-the repacked one:
+the repacked one for the variant you want:
 
 ```bash
-fastboot flash boot boot.img
+fastboot flash boot droidspaces-enforcing-boot.img
 ```
 
-That variant is a lossless `unpack_bootimg --format=mkbootimg` →
-`mkbootimg` round-trip with only the kernel payload swapped, and the AVB hash
-footer re-added at the original partition size. It will **not** contain a Magisk
-patch — flash Magisk again afterwards if you go this route.
+Each is a lossless `unpack_bootimg --format=mkbootimg` → `mkbootimg` round-trip
+with only the kernel payload swapped, then given a fresh AVB hash footer with
+algorithm `NONE` — re-signing would need Volla's private AVB key, which nobody
+outside Volla has. It therefore requires an unlocked bootloader, which flashing a
+custom kernel implies anyway. It will **not** contain a Magisk patch — flash
+Magisk again afterwards if you go this route.
+
+To go back to stock:
+
+```bash
+fastboot flash boot stock-boot.img
+```
 
 ---
 
 ## Rooting
 
-This kernel deliberately contains **no** KernelSU, KernelSU-Next, SukiSU or any
-other in-kernel root implementation. Root it from userspace instead:
+**No variant contains KernelSU, KernelSU-Next, SukiSU, APatch or any other
+in-kernel root implementation.** That is deliberate: keeping root out of the
+kernel means a kernel update never breaks root, and a root update never requires
+a kernel rebuild.
 
-- **Magisk** or **APatch** — patch your stock boot image as usual, flash it, then
-  flash the AnyKernel3 zip on top.
-- Then in the DroidSpaces app: enable **Daemon Mode** and reboot. Without
-  Daemon Mode, DroidSpaces cannot hold the root session it needs and containers
-  will fail to start.
+Root lives in a **different partition** from this kernel, which is why the two are
+independent:
+
+| Partition | Contains | Touched by this project |
+|---|---|---|
+| `boot` | kernel only (`ramdisk_size: 0`) | **yes** — this is what you flash |
+| `init_boot` | ramdisk only (`kernel_size: 0`) | **no** — never opened |
+
+### Patching `init_boot.img` with KernelSU
+
+1. Dump your stock `init_boot.img`:
+
+   ```bash
+   adb shell su -c "dd if=/dev/block/by-name/init_boot$(getprop ro.boot.slot_suffix) of=/sdcard/init_boot.img"
+   ```
+
+   or extract it from the Volla OS 16 factory image / OTA payload. Keep a copy —
+   it is your way back.
+2. Install the [KernelSU](https://github.com/tiann/KernelSU) manager app, and use
+   *Install → Select a file* on that `init_boot.img`. This is KernelSU's **LKM
+   mode**: it patches the ramdisk's `init` and loads `kernelsu.ko` at boot. GKI
+   mode (which requires the root implementation compiled into the kernel) is
+   neither needed nor supported here.
+3. Flash the result:
+
+   ```bash
+   fastboot flash init_boot init_boot_patched.img
+   ```
+4. Flash a kernel from a release, and reboot.
+
+LKM mode works on all three variants because `CONFIG_KPROBES`,
+`CONFIG_KALLSYMS_ALL`, `CONFIG_MODULES` and `CONFIG_MODULE_UNLOAD` are `=y` and
+`CONFIG_MODULE_SIG_FORCE` is off — verified in each variant's
+`build.config.resolved` before the release is cut.
+
+**Magisk** and **APatch** work the same way, also on `init_boot`.
+
+**If you are already rooted, do not restore stock `init_boot` before flashing a
+kernel from here.** Flashing `boot` leaves your root patch alone; reverting
+`init_boot` would only remove root. The AnyKernel3 zip is the same story — it
+only runs `split_boot; flash_boot;` and never opens `init_boot`.
+
+Afterwards, in the DroidSpaces app: enable **Daemon Mode** and reboot. Without
+Daemon Mode, DroidSpaces cannot hold the root session it needs and containers
+will fail to start.
 
 **SuSFS is not supported by DroidSpaces.** If you are running a SuSFS-patched
 root solution, DroidSpaces is expected to misbehave; use a plain build.

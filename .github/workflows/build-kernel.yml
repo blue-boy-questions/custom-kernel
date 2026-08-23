@@ -1,17 +1,34 @@
 # ---------------------------------------------------------------------------
-# Volla Phone Quintus (algiz) - DroidSpaces-enabled Linux 6.6 kernel
+# Volla Phone Quintus (algiz) - Linux 6.6 kernel, three variants
 #
-# Builds HelloVolla's MT6877 kernel (6.6.89) with Kleaf/Bazel, patched so that
-# DroidSpaces-OSS works, and packages the result as an AnyKernel3 zip and
-# (optionally) a repacked boot.img.
+# Builds HelloVolla's MT6877 kernel (6.6.89) with Kleaf/Bazel and publishes all
+# three variants side by side in a single GitHub release:
 #
-# No root solution is compiled into this kernel by design - see README.md.
+#   droidspaces-enforcing  DroidSpaces config + SYSVIPC kABI patch. SELinux
+#                          untouched, i.e. enforcing. The safe default.
+#   droidspaces-permissive Same, plus SELinux made permanently permissive.
+#   stock-permissive       No DroidSpaces changes at all. Stock gki_defconfig,
+#                          no kABI patch, only the permissive SELinux patch.
+#
+# "Permissive" is NOT selinux=0: selinuxfs stays mounted and the policy is
+# still loaded (Android init requires both), but nothing is ever denied.
+#
+# No root solution is compiled into any variant by design - see README.md.
 # ---------------------------------------------------------------------------
-name: Build algiz DroidSpaces kernel
+name: Build algiz kernels
 
 on:
   workflow_dispatch:
     inputs:
+      variants:
+        description: "Which variants to build."
+        type: choice
+        default: all
+        options:
+          - all
+          - droidspaces-enforcing
+          - droidspaces-permissive
+          - stock-permissive
       build_scope:
         description: "image = GKI Image only (default, kABI-safe). dist = full MediaTek dist build (all vendor modules, ~3-5h)"
         type: choice
@@ -73,9 +90,54 @@ env:
   BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN: "1"
 
 jobs:
+  # Turns the `variants` input into a matrix. A matrix cannot be filtered by an
+  # input directly, so it is computed here and consumed via fromJSON below.
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      count: ${{ steps.pick.outputs.count }}
+    steps:
+      - name: Decide which variants to build
+        id: pick
+        env:
+          WANT: ${{ inputs.variants || 'all' }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/all.json <<'JSON'
+          [
+            {"variant":"droidspaces-enforcing","droidspaces":true,"permissive":false,
+             "label":"DroidSpaces, SELinux enforcing"},
+            {"variant":"droidspaces-permissive","droidspaces":true,"permissive":true,
+             "label":"DroidSpaces, SELinux permissive"},
+            {"variant":"stock-permissive","droidspaces":false,"permissive":true,
+             "label":"Stock config, SELinux permissive"}
+          ]
+          JSON
+          if [ "$WANT" = "all" ]; then
+            sel=$(jq -c '.' /tmp/all.json)
+          else
+            sel=$(jq -c --arg v "$WANT" '[.[] | select(.variant == $v)]' /tmp/all.json)
+          fi
+          n=$(jq 'length' <<<"$sel")
+          [ "$n" -gt 0 ] || { echo "::error::no variant matches '$WANT'"; exit 1; }
+          echo "matrix={\"include\":$sel}" >> "$GITHUB_OUTPUT"
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "Building $n variant(s):"
+          jq -r '.[] | "  " + .variant + "  (" + .label + ")"' <<<"$sel"
+
   build:
+    needs: plan
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+    strategy:
+      # One variant failing must not cancel the others: a partial release is
+      # more useful than none, and the release job tolerates missing variants.
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      VARIANT: ${{ matrix.variant }}
+      VARIANT_LABEL: ${{ matrix.label }}
 
     steps:
       - name: Checkout this repository
@@ -145,6 +207,7 @@ jobs:
           bash recipe/scripts/setup-workspace.sh "$WS" recipe/local_manifests/algiz.xml
 
       - name: Apply the DroidSpaces SYSVIPC kABI patch
+        if: matrix.droidspaces
         working-directory: ${{ env.WS }}
         run: |
           set -euo pipefail
@@ -195,15 +258,58 @@ jobs:
           fi
 
       - name: Apply the DroidSpaces defconfig fragment
+        if: matrix.droidspaces
         working-directory: ${{ env.WS }}
         run: |
           set -euo pipefail
           bash "$GITHUB_WORKSPACE/recipe/scripts/apply-droidspaces-config.sh" \
             "$KERNEL_DIR/arch/arm64/configs/gki_defconfig"
-      - name: Neutralize check_defconfig on the GKI-side build config
+
+      - name: Make SELinux permanently permissive
+        if: matrix.permissive
         working-directory: ${{ env.WS }}
         run: |
           set -euo pipefail
+          cd "$KERNEL_DIR"
+          h=security/selinux/include/security.h
+          pf="$GITHUB_WORKSPACE/recipe/patches/002.selinux-permanently-permissive.patch"
+
+          # CONFIG_SECURITY_SELINUX_DEVELOP=y is what puts the real
+          # READ_ONCE(selinux_state.enforcing) body in scope. Without it the
+          # #else branch (return true) is compiled and the patch would apply to
+          # dead code, silently producing an enforcing kernel.
+          grep -qx 'CONFIG_SECURITY_SELINUX_DEVELOP=y' arch/arm64/configs/gki_defconfig \
+            || grep -q 'default y' security/selinux/Kconfig \
+            || { echo "::error::SECURITY_SELINUX_DEVELOP is not enabled; the patch would be dead code"; exit 1; }
+
+          patch -p1 --dry-run --silent < "$pf" \
+            || { echo "::error::002.selinux-permanently-permissive.patch does not apply to $h"; exit 1; }
+          patch -p1 < "$pf"
+
+          echo "::group::enforcing_enabled() after patching"
+          sed -n '/^#ifdef CONFIG_SECURITY_SELINUX_DEVELOP$/,/^#else$/p' "$h"
+          echo "::endgroup::"
+
+          # Assert the outcome rather than trusting patch's exit code: the
+          # DEVELOP branch must now return false, and enforcing_set() must be
+          # left alone so /sys/fs/selinux/enforce stays writable.
+          awk '/^#ifdef CONFIG_SECURITY_SELINUX_DEVELOP$/{f=1} f{print} /^#else$/{if(f)exit}' "$h" \
+            > /tmp/develop-branch.txt
+          grep -q 'return false;' /tmp/develop-branch.txt \
+            || { echo "::error::enforcing_enabled() does not return false after patching"; exit 1; }
+          grep -q 'WRITE_ONCE(selinux_state.enforcing, value);' /tmp/develop-branch.txt \
+            || { echo "::error::enforcing_set() was altered; setenforce would stop working"; exit 1; }
+          echo "SELinux is now permanently permissive (selinuxfs and policy load untouched)."
+
+      - name: Neutralize check_defconfig on the GKI-side build config
+        if: matrix.droidspaces
+        working-directory: ${{ env.WS }}
+        run: |
+          set -euo pipefail
+          # Only needed when gki_defconfig has been edited. The stock variant
+          # leaves it byte-identical, so `make savedefconfig` still matches and
+          # check_defconfig passes on its own - leave the vendor tree alone there.
+          #
           # For MODE=user, define_mgk() remaps build_variant to "ack", so the
           # guard `gki_mixed_build or (build_variant != "ack")` in
           # _mgk_build_config_impl is false and the generated GKI-side build
@@ -396,7 +502,7 @@ jobs:
           ls -lh "$art"
           echo "::endgroup::"
 
-      - name: Verify the built .config
+      - name: Locate and archive the built .config
         working-directory: ${{ env.WS }}
         env:
           MODE: ${{ inputs.mode || 'user' }}
@@ -418,6 +524,19 @@ jobs:
           [ -n "$cfg" ] || { echo "::error::could not locate the built .config"; exit 1; }
           echo "Using .config: $cfg"
           cp -f "$cfg" "$ART/build.config.resolved"
+          # Downstream verification steps read this instead of repeating the
+          # search above; the file is a release asset either way.
+          echo "CFG=$ART/build.config.resolved" >> "$GITHUB_ENV"
+
+      - name: Verify the DroidSpaces options
+        # Skipped for stock-permissive: none of these symbols were touched
+        # there, several are genuinely absent from the stock defconfig, and
+        # failing on that would fail the variant by design.
+        if: matrix.droidspaces
+        working-directory: ${{ env.WS }}
+        run: |
+          set -euo pipefail
+          cfg="$CFG"
 
           fail=0
           echo "== DroidSpaces GKI-exclusive options =="
@@ -492,10 +611,73 @@ jobs:
           grep -m1 '^CONFIG_LOCALVERSION=' "$cfg" || true
 
           [ "$fail" -eq 0 ] || { echo "::error::the built .config does not satisfy DroidSpaces"; exit 1; }
+
+      - name: Verify the SELinux and root-related options
+        working-directory: ${{ env.WS }}
+        env:
+          PERMISSIVE: ${{ matrix.permissive }}
+        run: |
+          set -euo pipefail
+          cfg="$CFG"
+          fail=0
+
+          # CONFIG_SECURITY_SELINUX_DEVELOP is the branch the permissive patch
+          # edits. Without it the compiler takes the #else path (return true)
+          # and the patch is dead code, so this is a hard requirement for the
+          # permissive variants and worth reporting for the enforcing one.
+          if grep -qx 'CONFIG_SECURITY_SELINUX_DEVELOP=y' "$cfg"; then
+            echo "  ok    CONFIG_SECURITY_SELINUX_DEVELOP=y (the patched branch is the compiled one)"
+          elif [ "$PERMISSIVE" = "true" ]; then
+            echo "  FAIL  CONFIG_SECURITY_SELINUX_DEVELOP is not =y - the permissive patch is dead code"
+            fail=1
+          else
+            echo "  note  CONFIG_SECURITY_SELINUX_DEVELOP not =y"
+          fi
+
+          # enforcing_enabled() is a static inline in a header, so the result is
+          # not visible in .config at all. Prove it from vmlinux instead: with
+          # `return false` the only remaining reader of selinux_state.enforcing
+          # is selinuxfs/enforcing_set, and selinux_enforcing_boot-style strings
+          # are unaffected. The definitive check is the source assertion in the
+          # patch step; this one confirms the built image agrees.
+          if [ "$PERMISSIVE" = "true" ]; then
+            echo "  info  SELinux is permissive by patch (asserted at source level before the build)"
+          else
+            echo "  info  SELinux left stock (enforcing)"
+          fi
+
+          echo "== KernelSU LKM prerequisites (root is added by you, not by this kernel) =="
+          for s in KPROBES KALLSYMS_ALL MODULES MODULE_UNLOAD; do
+            if grep -qx "CONFIG_${s}=y" "$cfg"; then
+              printf '  ok    CONFIG_%s=y\n' "$s"
+            else
+              printf '  WARN  CONFIG_%s not =y - KernelSU LKM mode may not work\n' "$s"
+            fi
+          done
+          if grep -qx 'CONFIG_MODULE_SIG_FORCE=y' "$cfg"; then
+            echo "  WARN  CONFIG_MODULE_SIG_FORCE=y - unsigned kernelsu.ko would be rejected"
+          else
+            echo "  ok    CONFIG_MODULE_SIG_FORCE not set - unsigned modules can load"
+          fi
+
+          echo "== kABI / module-loading guarantees =="
+          for s in MODVERSIONS MODULE_SIG_PROTECT; do
+            if grep -qx "CONFIG_${s}=y" "$cfg"; then
+              printf '  ok    CONFIG_%s=y\n' "$s"
+            else
+              printf '  WARN  CONFIG_%s not set - stock vendor modules may be rejected\n' "$s"
+            fi
+          done
+          grep -m1 '^CONFIG_LOCALVERSION=' "$cfg" || true
+
+          [ "$fail" -eq 0 ] || { echo "::error::the built .config does not match the requested variant"; exit 1; }
       - name: Package the AnyKernel3 zip
         working-directory: ${{ env.WS }}
         env:
           MODE: ${{ inputs.mode || 'user' }}
+          BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
+          DROIDSPACES: ${{ matrix.droidspaces }}
+          PERMISSIVE: ${{ matrix.permissive }}
         run: |
           set -euo pipefail
           ak="$PWD/ak3"
@@ -509,6 +691,13 @@ jobs:
 
           cp -f "$GITHUB_WORKSPACE/recipe/anykernel3/anykernel.sh" "$ak/anykernel.sh"
 
+          # Make the flashed zip say which variant it is. AK3 prints
+          # kernel.string during install, so this is the only place the user
+          # sees it if the three zips get renamed or mixed up.
+          sed -i "s|^kernel\.string=.*|kernel.string=Volla Quintus (algiz) ${VARIANT_LABEL}|" \
+            "$ak/anykernel.sh"
+          grep '^kernel.string=' "$ak/anykernel.sh"
+
           # ak3-core.sh flash_boot() picks the first match from a fixed list
           # (zImage..., Image, ..., Image.gz, ..., Image.lz4). Ship the raw
           # Image only, so there is no ambiguity about which one gets flashed.
@@ -517,12 +706,30 @@ jobs:
           sver="$(sed -n 's/^CONFIG_LOCALVERSION="\(.*\)"$/\1/p' \
                   "$KERNEL_DIR/arch/arm64/configs/gki_defconfig" | head -1)"
           kver="$(sed -n 's/^VERSION = //p' "$KERNEL_DIR/Makefile" | head -1).$(sed -n 's/^PATCHLEVEL = //p' "$KERNEL_DIR/Makefile" | head -1).$(sed -n 's/^SUBLEVEL = //p' "$KERNEL_DIR/Makefile" | head -1)"
-          zipname="AK3-algiz-droidspaces-${kver}${sver}-${MODE}-$(date -u +%Y%m%d).zip"
+          zipname="AK3-algiz-${VARIANT}-${kver}${sver}-${MODE}-$(date -u +%Y%m%d).zip"
 
           ( cd "$ak" && zip -r9 "$ART/$zipname" . -x '.git*' >/dev/null )
           echo "ZIPNAME=$zipname" >> "$GITHUB_ENV"
           echo "KVER=${kver}${sver}" >> "$GITHUB_ENV"
           ls -lh "$ART/$zipname"
+
+          # The release job runs in a different job, so $GITHUB_ENV does not
+          # reach it. Everything it needs to describe this variant travels
+          # inside the artifact instead.
+          cat > "$ART/variant.json" <<JSON
+          {
+            "variant": "${VARIANT}",
+            "label": "${VARIANT_LABEL}",
+            "droidspaces": ${DROIDSPACES},
+            "permissive": ${PERMISSIVE},
+            "kver": "${kver}${sver}",
+            "zipname": "${zipname}",
+            "mode": "${MODE}",
+            "scope": "${BUILD_SCOPE}"
+          }
+          JSON
+          # Fail here rather than in the release job if the heredoc ever drifts.
+          jq -e . "$ART/variant.json" > /dev/null
 
       - name: Repack boot.img (only when a stock boot.img is supplied)
         working-directory: ${{ env.WS }}
@@ -638,11 +845,14 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: algiz-droidspaces-kernel-${{ inputs.mode || 'user' }}-${{ github.run_number }}
+          # One artifact per variant. The release job globs `algiz-kernel-*` and
+          # relies on the trailing variant name to label and rename the assets.
+          name: algiz-kernel-${{ github.run_number }}-${{ matrix.variant }}
           if-no-files-found: error
           retention-days: 30
           path: |
             ${{ env.WS }}/artifacts/*.zip
+            ${{ env.WS }}/artifacts/variant.json
             ${{ env.WS }}/artifacts/boot.img
             ${{ env.WS }}/artifacts/Image
             ${{ env.WS }}/artifacts/Image.lz4
@@ -655,69 +865,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: algiz-droidspaces-debug-${{ inputs.mode || 'user' }}-${{ github.run_number }}
+          name: algiz-debug-${{ github.run_number }}-${{ matrix.variant }}
           if-no-files-found: ignore
           retention-days: 7
           path: |
             ${{ env.WS }}/artifacts/vmlinux.zst
             ${{ env.WS }}/artifacts/vmlinux.symvers
             ${{ env.WS }}/artifacts/modules/**
-
-      - name: Publish release
-        # Manual runs only. The push trigger fires on any change under
-        # scripts/**, patches/**, anykernel3/** or this file, and turning those
-        # into public releases would be noise.
-        if: success() && github.event_name == 'workflow_dispatch' && inputs.publish_release
-        working-directory: ${{ env.WS }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          MODE: ${{ inputs.mode || 'user' }}
-          BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
-        run: |
-          set -euo pipefail
-          cd "$ART"
-
-          # gh needs a concrete tag. KVER/ZIPNAME come from the packaging step's
-          # $GITHUB_ENV exports, so the tag can never disagree with the zip.
-          # The run number keeps two builds on the same day from colliding.
-          tag="v${KVER}-droidspaces-${GITHUB_RUN_NUMBER}"
-
-          # Build the asset list from what actually exists: boot.img is
-          # conditional, and a `dist` build produces a different module set.
-          # Naming a missing file would abort the step under `set -e`.
-          assets=()
-          for f in *.zip Image Image.lz4 Image.gz System.map \
-                   build.config.resolved modules.builtin modules.builtin.modinfo \
-                   boot.img; do
-            [ -f "$f" ] && assets+=("$f")
-          done
-          [ "${#assets[@]}" -gt 0 ] || { echo "::error::no artifacts to release"; exit 1; }
-
-          sha256sum -- "${assets[@]}" > SHA256SUMS
-          assets+=(SHA256SUMS)
-          cat SHA256SUMS
-          echo "attaching ${#assets[@]} assets"
-
-          # Invoked through `bash` rather than executed directly: the repo is
-          # authored on Windows with core.filemode=false, so a missing exec bit
-          # in the index is easy to introduce and would only ever show up here,
-          # as Permission denied, after a ~25 minute build.
-          bash "$GITHUB_WORKSPACE/recipe/scripts/release-notes.sh" \
-            "$KVER" "$ZIPNAME" "$MODE" "$BUILD_SCOPE" "$GITHUB_RUN_NUMBER" \
-            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
-            > /tmp/notes.md
-
-          gh release create "$tag" \
-            --title "algiz DroidSpaces kernel ${KVER} (build ${GITHUB_RUN_NUMBER})" \
-            --notes-file /tmp/notes.md \
-            --target "$GITHUB_SHA" \
-            "${assets[@]}"
-
-          url="$(gh release view "$tag" --json url --jq .url)"
-          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
-          echo "RELEASE_URL=$url" >> "$GITHUB_ENV"
-          echo "published $url"
 
       - name: Summary
         if: always()
@@ -728,12 +882,13 @@ jobs:
         run: |
           set -uo pipefail
           {
-            echo "## Volla Quintus (algiz) DroidSpaces kernel"
+            echo "## algiz kernel - \`${VARIANT}\`"
             echo
             echo "| | |"
             echo "|---|---|"
+            echo "| Variant | \`${VARIANT}\` — ${VARIANT_LABEL} |"
             echo "| Kernel | \`${KVER:-unknown}\` |"
-            echo "| Variant | \`$MODE\` |"
+            echo "| MTK mode | \`$MODE\` |"
             echo "| Scope | \`$BUILD_SCOPE\` |"
             echo "| AK3 zip | \`${ZIPNAME:-not built}\` |"
             if [ -f artifacts/boot.img ]; then
@@ -741,17 +896,9 @@ jobs:
             else
               echo "| boot.img | not built (no stock boot.img supplied) |"
             fi
-            if [ -n "${RELEASE_URL:-}" ]; then
-              echo "| Release | [\`${RELEASE_TAG}\`](${RELEASE_URL}) |"
-            fi
             echo
-            echo "### Flashing"
-            echo
-            echo '1. Root first with Magisk or APatch (this kernel contains no root solution).'
-            echo '2. Flash the AnyKernel3 zip from a custom recovery or via the Magisk app.'
-            echo '   It replaces only the kernel image and keeps your existing ramdisk, so'
-            echo '   an already-patched Magisk boot image stays patched.'
-            echo '3. Open DroidSpaces, enable **Daemon Mode**, and reboot.'
+            echo "The release is cut once, by the \`release\` job, after all"
+            echo "variants finish."
             echo
             echo "### Artifacts"
             echo '```'
@@ -763,3 +910,153 @@ jobs:
         if: always()
         run: df -h / /mnt || true
 
+  # One release for all variants. This has to be a separate job: the release
+  # step used to live inside the build job, which under a matrix would cut one
+  # release per variant instead of the single combined release asked for.
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    # always(): a variant that failed must not suppress the release of the ones
+    # that succeeded (fail-fast is off above for the same reason). The step
+    # below still refuses to publish an empty release.
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.publish_release
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: recipe
+
+      - name: Download every variant's artifacts
+        uses: actions/download-artifact@v4
+        with:
+          # Only this run's kernel artifacts; the debug artifacts (vmlinux,
+          # ~200 MB compressed per variant) are deliberately not released.
+          pattern: algiz-kernel-${{ github.run_number }}-*
+          path: dl
+
+      - name: Publish one release with all variants
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MODE: ${{ inputs.mode || 'user' }}
+          BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
+          WANTED: ${{ needs.plan.outputs.count }}
+        run: |
+          set -euo pipefail
+          stage=/tmp/release
+          meta=/tmp/meta
+          rm -rf "$stage" "$meta"; mkdir -p "$stage" "$meta"
+
+          # Per-variant files share names (Image, boot.img, ...), so everything
+          # except the already-variant-named AK3 zip is prefixed on the way in.
+          # variant.json is metadata for the notes, not an asset.
+          shopt -s nullglob
+          variants=()
+          for d in dl/algiz-kernel-*; do
+            [ -f "$d/variant.json" ] || { echo "::warning::$d has no variant.json - skipped"; continue; }
+            v="$(jq -r .variant "$d/variant.json")"
+            echo "::group::$v"
+            cp -f "$d/variant.json" "$meta/$v.json"
+            for f in "$d"/*; do
+              b="${f##*/}"
+              case "$b" in
+                variant.json) continue ;;
+                *.zip)        cp -f "$f" "$stage/$b" ;;
+                *)            cp -f "$f" "$stage/${v}-${b}" ;;
+              esac
+              echo "  $b"
+            done
+            echo "::endgroup::"
+            variants+=("$v")
+          done
+
+          [ "${#variants[@]}" -gt 0 ] || {
+            echo "::error::no variant produced artifacts - nothing to release"
+            exit 1
+          }
+          echo "staged ${#variants[@]} of ${WANTED} requested variant(s): ${variants[*]}"
+          if [ "${#variants[@]}" -lt "$WANTED" ]; then
+            echo "::warning::only ${#variants[@]} of ${WANTED} variants built; releasing what exists"
+          fi
+
+          # The tag needs the kernel version, which is identical across
+          # variants (same source tree, same LOCALVERSION) - take it from the
+          # first one and assert the rest agree, so a silent mismatch cannot
+          # end up mislabelled.
+          kver="$(jq -r .kver "$meta/${variants[0]}.json")"
+          for v in "${variants[@]}"; do
+            k="$(jq -r .kver "$meta/$v.json")"
+            [ "$k" = "$kver" ] || {
+              echo "::error::variant $v built kernel $k, expected $kver"
+              exit 1
+            }
+          done
+          # The run number keeps two builds on the same day from colliding.
+          tag="v${kver}-${GITHUB_RUN_NUMBER}"
+
+          cd "$stage"
+          mapfile -t assets < <(ls -1)
+          sha256sum -- "${assets[@]}" > SHA256SUMS
+          assets+=(SHA256SUMS)
+          cat SHA256SUMS
+          echo "attaching ${#assets[@]} assets"
+
+          # Invoked through `bash` rather than executed directly: the repo is
+          # authored on Windows with core.filemode=false, so a missing exec bit
+          # in the index is easy to introduce and would only ever show up here,
+          # as Permission denied, after a ~25 minute build.
+          jq -s '.' "$meta"/*.json > /tmp/variants.json
+          bash "$GITHUB_WORKSPACE/recipe/scripts/release-notes.sh" \
+            "$kver" /tmp/variants.json "$MODE" "$BUILD_SCOPE" \
+            "$GITHUB_RUN_NUMBER" \
+            "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            > /tmp/notes.md
+
+          gh release create "$tag" \
+            --title "algiz kernel ${kver} - ${#variants[@]} variants (build ${GITHUB_RUN_NUMBER})" \
+            --notes-file /tmp/notes.md \
+            --target "$GITHUB_SHA" \
+            "${assets[@]}"
+
+          url="$(gh release view "$tag" --json url --jq .url)"
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "RELEASE_URL=$url" >> "$GITHUB_ENV"
+          echo "VARIANTS=${variants[*]}" >> "$GITHUB_ENV"
+          echo "published $url"
+
+      - name: Verify every asset actually uploaded
+        run: |
+          set -euo pipefail
+          # A GitHub release asset stuck in state "starter" is a truncated
+          # upload; it never heals, and the download 404s. gh release create
+          # exits 0 regardless, so check explicitly.
+          bad="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+                   --jq '.assets[] | select(.state != "uploaded") | .name')"
+          [ -z "$bad" ] || { echo "::error::assets not fully uploaded: $bad"; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            --jq '.assets[] | "  \(.state)  \(.size)  \(.name)"'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## algiz kernels - one release, all variants"
+            echo
+            if [ -n "${RELEASE_URL:-}" ]; then
+              echo "Released [\`${RELEASE_TAG}\`](${RELEASE_URL}) with variants: \`${VARIANTS:-}\`"
+            else
+              echo "No release was published."
+            fi
+            echo
+            echo "| Variant | What it is | Pick it when |"
+            echo "|---|---|---|"
+            echo "| \`droidspaces-enforcing\` | DroidSpaces + SELinux enforcing | You want DroidSpaces and stock security. Start here. |"
+            echo "| \`droidspaces-permissive\` | DroidSpaces + SELinux permissive | Something in a container is blocked by SELinux. |"
+            echo "| \`stock-permissive\` | Stock config + SELinux permissive | You do not use DroidSpaces and only need permissive. |"
+            echo
+            echo "Root is **not** in any of these. Patch \`init_boot.img\` with"
+            echo "KernelSU (LKM mode) — see the release notes."
+          } >> "$GITHUB_STEP_SUMMARY"

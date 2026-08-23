@@ -4,8 +4,8 @@
 stock image is attached to the
 [`stock-images-algiz`](https://github.com/blue-boy-questions/custom-kernel/releases/tag/stock-images-algiz)
 release; pass that asset's download URL as the workflow's `boot_img_url` input and
-the run will emit a repacked, fastboot-flashable `boot.img` alongside the
-AnyKernel3 zip:
+every variant in the run will emit a repacked, fastboot-flashable
+`<variant>-boot.img` alongside its AnyKernel3 zip:
 
 ```
 https://github.com/blue-boy-questions/custom-kernel/releases/download/stock-images-algiz/boot.img
@@ -38,6 +38,11 @@ not boot.
 
 Alternatively, don't commit anything here and pass the `boot_img_url` input when
 running the workflow. A committed `boot/boot.img` takes precedence over the URL.
+
+One stock image serves all three variants: it is unpacked once per variant and
+only the kernel payload is swapped, so the release carries
+`droidspaces-enforcing-boot.img`, `droidspaces-permissive-boot.img` and
+`stock-permissive-boot.img`. Flash exactly one.
 
 Note that a repacked `boot.img` contains **no** Magisk patch; re-patch it with
 Magisk afterwards, or just flash the AnyKernel3 zip instead (that path preserves
