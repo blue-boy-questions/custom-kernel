@@ -29,10 +29,10 @@ set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
 } # end attributes
 
 # boot shell variables
-# BLOCK=auto detects the boot partition by name; IS_SLOT_DEVICE=auto appends the
-# active slot suffix on A/B devices (Quintus ships Android 16 / A-B).
-BLOCK=auto;
-IS_SLOT_DEVICE=auto;
+# Force the kernel target to boot; init_boot on algiz contains only the ramdisk.
+# IS_SLOT_DEVICE appends the active A/B slot suffix automatically.
+BLOCK=/dev/block/by-name/boot;
+IS_SLOT_DEVICE=1;
 RAMDISK_COMPRESSION=auto;
 PATCH_VBMETA_FLAG=auto;
 

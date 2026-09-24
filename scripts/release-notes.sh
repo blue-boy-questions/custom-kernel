@@ -183,9 +183,10 @@ cat <<EOF
 
 It replaces **only the kernel image** and leaves your ramdisk untouched, so an
 already-patched boot image stays patched (\`ak3-core.sh\` detects Magisk and
-re-applies the kernel-side patch on repack). \`BLOCK=auto\` and
-\`IS_SLOT_DEVICE=auto\` handle the A/B slot suffix. Each zip prints which
-variant it is while installing.
+re-applies the kernel-side patch on repack). The installer explicitly targets
+\`/dev/block/by-name/boot\`; \`IS_SLOT_DEVICE=1\` appends the active A/B
+slot suffix and prevents AnyKernel3 from incorrectly selecting \`init_boot\`.
+Each zip prints which variant it is while installing.
 
 **Or** flash the matching \`<variant>-boot.img\` with
 \`fastboot flash boot <variant>-boot.img\`. Those are attached only when a stock
