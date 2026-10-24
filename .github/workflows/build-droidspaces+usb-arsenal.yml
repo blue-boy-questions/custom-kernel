@@ -1,8 +1,10 @@
 # ------------------------------------------------------------------
 # Volla Phone Quintus (algiz) - Linux 6.6 kernel, eight variants
 #
-# Self-contained GitHub Actions workflow. Replacing ONLY this file
-# (.github/workflows/build-kernel.yml) builds all 8 variants for 6.6.89
+# Self-contained GitHub Actions workflow. It replaces the old
+# .github/workflows/build-kernel.yml (delete that file: both share the same
+# name and push trigger, and run numbers differ per workflow, so release tags
+# could collide). It builds all 8 variants for 6.6.89
 # and auto-releases them without needing to edit scripts/apply-droidspaces-config.sh
 # or scripts/release-notes.sh:
 #
@@ -72,14 +74,15 @@ on:
     # auto-releases all 8 variants.
     branches: [main]
     paths:
-      - ".github/workflows/build-kernel.yml"
+      - ".github/workflows/build-droidspaces+usb-arsenal.yml"
       - "patches/**"
       - "scripts/**"
       - "local_manifests/**"
       - "anykernel3/**"
+      - "boot/**"
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   KERNEL_DIR: kernel-6.6
@@ -88,6 +91,10 @@ env:
   KERNEL_VERSION_NUM: "6.6"
   KERNEL_VERSION: kernel-6.6
   KLEAF_GKI_CHECKER: "no"
+  # Pin the upstream patch repos to a commit SHA (or tag) for reproducible builds.
+  # HEAD = latest default branch (previous behaviour).
+  DROIDSPACES_OSS_REF: "HEAD"
+  USB_ARSENAL_REF: "HEAD"
   BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN: "1"
 
 jobs:
@@ -227,7 +234,9 @@ jobs:
           # Fetch latest upstream Droidspaces-OSS patches as fallback if needed
           ds_dir="/tmp/droidspaces-oss"
           rm -rf "$ds_dir"
-          git clone --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git "$ds_dir" || true
+          git init -q "$ds_dir" \
+            && git -C "$ds_dir" fetch -q --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git "$DROIDSPACES_OSS_REF" \
+            && git -C "$ds_dir" checkout -q FETCH_HEAD || true
 
           applied=""
           for p in 001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch \
@@ -267,7 +276,10 @@ jobs:
           ua_dir="/tmp/usb-arsenal"
           rm -rf "$ua_dir"
           echo "==> Fetching latest USB-Arsenal 6.6 patches from ravindu644/USB-Arsenal"
-          git clone --depth=1 https://github.com/ravindu644/USB-Arsenal.git "$ua_dir"
+          git init -q "$ua_dir"
+          git -C "$ua_dir" fetch -q --depth=1 https://github.com/ravindu644/USB-Arsenal.git "$USB_ARSENAL_REF"
+          git -C "$ua_dir" checkout -q FETCH_HEAD
+          echo "USB-Arsenal at $(git -C "$ua_dir" rev-parse HEAD)"
 
           patch_dir="$ua_dir/kernel-patches/6.6"
           if [ ! -d "$patch_dir" ] && [ -d "$GITHUB_WORKSPACE/recipe/patches/usb-arsenal" ]; then
@@ -435,6 +447,7 @@ jobs:
             done
           fi
 
+          printf '%s\n' "${UA_SYMBOLS[@]:-}" | sed '/^$/d' > "$WS/ua-symbols.txt"
           diff -u "${DEFCONFIG}.orig.bak" "$DEFCONFIG" || true
           rm -f "${DEFCONFIG}.orig.bak"
           [ "$bad" -eq 0 ] || { echo "::error::defconfig verification failed"; exit 1; }
@@ -449,7 +462,7 @@ jobs:
           pf="$GITHUB_WORKSPACE/recipe/patches/002.selinux-permanently-permissive.patch"
 
           grep -qx 'CONFIG_SECURITY_SELINUX_DEVELOP=y' arch/arm64/configs/gki_defconfig \
-            || grep -q 'default y' security/selinux/Kconfig \
+            || awk '/^config SECURITY_SELINUX_DEVELOP/{f=1;next} /^config /{f=0} f&&/default y/{ok=1} END{exit !ok}' security/selinux/Kconfig \
             || { echo "::error::SECURITY_SELINUX_DEVELOP is not enabled; the patch would be dead code"; exit 1; }
 
           patch -p1 --dry-run --silent < "$pf" \
@@ -706,18 +719,18 @@ jobs:
 
           if [ "$USBARSENAL" = "true" ]; then
             echo "== USB-Arsenal core Gadget & ConfigFS options =="
-            for s in USB_GADGET USB_CONFIGFS USB_CONFIGFS_UEVENT \
-                     USB_CONFIGFS_SERIAL USB_CONFIGFS_ACM USB_CONFIGFS_OBEX \
-                     USB_CONFIGFS_NCM USB_CONFIGFS_ECM USB_CONFIGFS_ECM_SUBSET \
-                     USB_CONFIGFS_RNDIS USB_CONFIGFS_EEM USB_CONFIGFS_MASS_STORAGE \
-                     USB_CONFIGFS_F_FS USB_CONFIGFS_F_ACC USB_CONFIGFS_F_HID; do
+            # Verify exactly what the apply step enabled (it skips symbols absent
+            # from this tree's Kconfig and may use their aliases), not a fixed list.
+            [ -s "$WS/ua-symbols.txt" ] || { echo "  FAIL ua-symbols.txt missing/empty"; fail=1; }
+            while read -r s; do
+              [ -n "$s" ] || continue
               v="$(sed -n "s/^CONFIG_${s}=//p" "$cfg" | head -1)"
               case "$v" in
                 y) printf '  ok    CONFIG_%s=y\n' "$s" ;;
                 m) printf '  ok    CONFIG_%s=m (module, loadable)\n' "$s" ;;
-                *) printf '  FAIL  CONFIG_%s not enabled\n' "$s"; fail=1 ;;
+                *) printf '  FAIL  CONFIG_%s not enabled (dropped by olddefconfig? check dependencies)\n' "$s"; fail=1 ;;
               esac
-            done
+            done < "$WS/ua-symbols.txt"
 
             echo "== USB-Arsenal extended Gadget functions =="
             for s in USB_CONFIGFS_F_LB_SS USB_CONFIGFS_F_AUDIO_SRC \
@@ -1000,9 +1013,58 @@ jobs:
         if: always()
         run: df -h / /mnt || true
 
+  # Advisory: exported-symbol CRCs must match the `stock` build, otherwise the
+  # variant's kABI drifted and stock vendor_dlkm modules may be rejected.
+  # Never blocks the release; it only annotates the run.
+  kabi:
+    needs: build
+    if: "!cancelled()"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download debug artifacts (vmlinux.symvers)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: algiz-debug-${{ github.run_number }}-*
+          path: dbg
+        continue-on-error: true
+
+      - name: Compare symbol CRCs against stock
+        run: |
+          set -uo pipefail
+          pre="dbg/algiz-debug-${{ github.run_number }}"
+          base="$pre-stock/vmlinux.symvers"
+          if [ ! -f "$base" ]; then
+            echo "No stock baseline in this run (build the 'stock' variant too) - skipping."
+            exit 0
+          fi
+          norm() { awk '{print $1, $2}' "$1" | sort; }
+          norm "$base" > /tmp/base.txt
+          {
+            echo "## kABI check vs stock"
+            echo
+            echo "| Variant | CRC differences |"
+            echo "|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for d in "$pre"-*; do
+            v="${d#"$pre"-}"
+            [ "$v" = "stock" ] && continue
+            [ -f "$d/vmlinux.symvers" ] || continue
+            norm "$d/vmlinux.symvers" > /tmp/var.txt
+            n="$(diff /tmp/base.txt /tmp/var.txt | grep -c '^[<>]' || true)"
+            echo "| \`$v\` | $n |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$n" -gt 0 ]; then
+              echo "::warning::$v: $n exported-symbol CRC line(s) differ from stock (kABI drift)"
+              diff /tmp/base.txt /tmp/var.txt | head -20
+            else
+              echo "$v: kABI CRCs identical to stock"
+            fi
+          done
+
   release:
     needs: [plan, build]
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     # Auto-release on push to main and on manual workflow_dispatch (unless publish_release is explicitly unchecked).
     if: "!cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release != false))"
     steps:
@@ -1165,17 +1227,6 @@ jobs:
             echo "| Variant | DroidSpaces | USB-Arsenal | SELinux | Pick it when |"
             echo "|---|---|---|---|---|"
             echo "| \`stock\` | No | No | Enforcing | Pure stock kernel and security. |"
-            echo "| \`stock-permissive\` | No | No | Permissive | Stock config with SELinux permissive. |"
-            echo "| \`droidspaces-enforcing\` | Yes | No | Enforcing | DroidSpaces containers with stock SELinux enforcing. |"
-            echo "| \`droidspaces-permissive\` | Yes | No | Permissive | DroidSpaces containers with SELinux permissive. |"
-            echo "| \`usbarsenal-enforcing\` | No | Yes | Enforcing | USB-Arsenal gadget emulation with SELinux enforcing. |"
-            echo "| \`usbarsenal-permissive\` | No | Yes | Permissive | USB-Arsenal gadget emulation with SELinux permissive. |"
-            echo "| \`droidspaces-usbarsenal-enforcing\` | Yes | Yes | Enforcing | Full DroidSpaces + USB-Arsenal with SELinux enforcing. |"
-            echo "| \`droidspaces-usbarsenal-permissive\` | Yes | Yes | Permissive | Full DroidSpaces + USB-Arsenal with SELinux permissive. |"
-            echo
-            echo "Root is **not** compiled into any variant. Patch \`init_boot.img\` with"
-            echo "KernelSU (LKM mode) - see the release notes."
-          } >> "$GITHUB_STEP_SUMMARY"
             echo "| \`stock-permissive\` | No | No | Permissive | Stock config with SELinux permissive. |"
             echo "| \`droidspaces-enforcing\` | Yes | No | Enforcing | DroidSpaces containers with stock SELinux enforcing. |"
             echo "| \`droidspaces-permissive\` | Yes | No | Permissive | DroidSpaces containers with SELinux permissive. |"
