@@ -349,8 +349,8 @@ jobs:
             # whitespace between `def` and the function name. Some mgk.bzl forks
             # indent the definition or use `def define_mgk =` (lambda-style), so
             # be lenient on the prefix and stop at the first closing paren.
-            awk '/def[[:space:]]+define_mgk\\(/{f=1} f{print} f && /\\):[[:space:]]*$/{exit}' "$mgk" \\\
-              | sed -n 's/^[[:space:]]*\\([a-z_][a-z_0-9]*\\)[[:space:]]*[,=:)].*/\\1/p' \\\
+            awk '/def[[:space:]]+define_mgk\(/{f=1} f{print} f && /\):[[:space:]]*$/{exit}' "$mgk" \
+              | sed -n 's/^[[:space:]]*\([a-z_][a-z_0-9]*\)[[:space:]]*[,=:)].*/\1/p' \
               | sort -u
           }
           kwargs() {
