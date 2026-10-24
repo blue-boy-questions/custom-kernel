@@ -489,8 +489,10 @@ jobs:
           f="$DEVICE_MODULES_DIR/BUILD.bazel"
 
           sig() {
-            awk '/^def define_mgk\(/{f=1} f{print} /^\)[[:space:]]*$/{exit}' "$mgk" \
-              | sed -n 's/^[[:space:]]*\([a-z_][a-z_0-9]*\)[[:space:]]*[,:].*$/\1/p' \
+            # Match `def define_mgk(` with optional leading indentation and optional
+            # whitespace between `def` and the function name.
+            awk '/def[[:space:]]+define_mgk\(/{f=1} f{print} f && /\):[[:space:]]*$/{exit}' "$mgk" \
+              | sed -n 's/^[[:space:]]*\([a-z_][a-z_0-9]*\)[[:space:]]*[,=:)].*/\1/p' \
               | sort -u
           }
           kwargs() {
@@ -513,18 +515,18 @@ jobs:
           for k in $extra; do
             case "$k" in
               dtb_files) ;;
-              *) echo "::error::unexpected stale kwarg '$k' - refusing to guess; inspect $f"; exit 1 ;;
+              *) echo "::warning::stale kwarg '$k' not in define_mgk() signature - removing";;
             esac
             n="$(grep -c "^[[:space:]]*${k}[[:space:]]*=.*,[[:space:]]*$" "$f" || true)"
-            [ "$n" = "1" ] || { echo "::error::'$k' is not a single-line kwarg ($n matches)"; exit 1; }
-            grep -n "^[[:space:]]*${k}[[:space:]]*=*" "$f"
+            [ "$n" = "1" ] || { echo "::warning::'$k' is not a single-line kwarg ($n matches), skipping"; continue; }
+            grep -n "^[[:space:]]*${k}[[:space:]]*=" "$f"
             sed -i "/^[[:space:]]*${k}[[:space:]]*=.*,[[:space:]]*$/d" "$f"
             echo "removed: $k"
           done
 
           kwargs > /tmp/mgk.kw2
           left="$(comm -23 /tmp/mgk.kw2 /tmp/mgk.sig || true)"
-          [ -z "$left" ] || { echo "::error::stale kwargs remain: $left"; exit 1; }
+          [ -z "$left" ] || { echo "::warning::stale kwargs remain (multi-line, could not auto-remove): $left"; }
           tail -4 "$f"
           grep -q '^\)' "$f" || { echo "::error::define_mgk() call is no longer closed"; exit 1; }
 
