@@ -541,7 +541,7 @@ jobs:
           left="$(comm -23 /tmp/mgk.kw2 /tmp/mgk.sig || true)"
           [ -z "$left" ] || { echo "::warning::stale kwargs remain (multi-line, could not auto-remove): $left"; }
           tail -4 "$f"
-          grep -q '^\)' "$f" || { echo "::error::define_mgk() call is no longer closed"; exit 1; }
+          grep -q '^)' "$f" || { echo "::error::define_mgk() call is no longer closed"; exit 1; }
 
       - name: Build
         working-directory: ${{ env.WS }}
