@@ -1,14 +1,19 @@
 # Volla Phone Quintus (`algiz`) — custom Linux 6.6 kernels
 
 Builds HelloVolla's MediaTek MT6877 kernel (**6.6.89**, Volla OS 16 / Android 16)
-from source in GitHub Actions and publishes **three variants side by side in one
+from source in GitHub Actions and publishes **up to eight variants side by side in one
 release**, each as an AnyKernel3 zip plus (optionally) a repacked `boot.img`.
 
-| Variant | DroidSpaces config | SELinux | Use it when |
-|---|---|---|---|
-| `droidspaces-enforcing` | yes | **enforcing** (stock) | **Start here.** You want [DroidSpaces](https://github.com/ravindu644/Droidspaces-OSS) and your phone's security model unchanged. |
-| `droidspaces-permissive` | yes | permanently permissive | Something inside a container is blocked and `dmesg` shows `avc: denied`. |
-| `stock-permissive` | no — stock `gki_defconfig` | permanently permissive | You do not use DroidSpaces and only want a permissive kernel. |
+| Variant | DroidSpaces | USB-Arsenal | SELinux | Use it when |
+|---|---|---|---|---|
+| `stock` | no | no | **enforcing** | Pure stock `gki_defconfig`; baseline and kABI reference. |
+| `stock-permissive` | no | no | permanently permissive | You only want a permissive kernel. |
+| `droidspaces-enforcing` | yes | no | **enforcing** | **Start here for containers.** You want [DroidSpaces](https://github.com/ravindu644/Droidspaces-OSS) and your phone's security model unchanged. |
+| `droidspaces-permissive` | yes | no | permanently permissive | Something inside a container is blocked and `dmesg` shows `avc: denied`. |
+| `usbarsenal-enforcing` | no | yes | **enforcing** | USB gadget emulation ([USB-Arsenal](https://github.com/ravindu644/USB-Arsenal): HID, mass storage, RNDIS, ...) with stock SELinux. |
+| `usbarsenal-permissive` | no | yes | permanently permissive | Same, when SELinux denials block a gadget function. |
+| `droidspaces-usbarsenal-enforcing` | yes | yes | **enforcing** | Both feature sets, stock SELinux. |
+| `droidspaces-usbarsenal-permissive` | yes | yes | permanently permissive | Both feature sets, permissive. |
 
 Flash exactly **one** of them. Nothing else about the kernel is changed, and
 **no root solution is compiled into any variant** — see [Rooting](#rooting).
@@ -22,7 +27,7 @@ Flash exactly **one** of them. Nothing else about the kernel is changed, and
 DroidSpaces needs Linux namespaces and IPC features that Android's GKI
 `gki_defconfig` ships disabled. Two changes are required, and only two:
 
-1. **The config fragment.** 17 symbols are enabled in
+1. **The config fragment.** 19 symbols are enabled in
    `kernel-6.6/arch/arm64/configs/gki_defconfig`
    ([scripts/apply-droidspaces-config.sh](scripts/apply-droidspaces-config.sh)) —
    SYSVIPC, POSIX message queues, IPC/PID namespaces, devtmpfs, user
@@ -98,7 +103,7 @@ enforcing kernel has actually got in your way.
 
 ### Why only the kernel image is rebuilt
 
-Because the layout is preserved in all three variants, the stock vendor modules
+Because the layout is preserved in all variants, the stock vendor modules
 keep loading:
 
 - `CONFIG_MODVERSIONS=y` → `same_magic()` in `kernel/module/version.c` skips the
@@ -116,11 +121,11 @@ multi-hour MediaTek `dist` build.
 
 | Path | Purpose |
 |---|---|
-| [.github/workflows/build-kernel.yml](.github/workflows/build-kernel.yml) | The whole build: a `plan` job computing the variant matrix, a matrixed `build` job, and a `release` job that cuts one release. Run it from the Actions tab. |
+| [.github/workflows/build-droidspaces+usb-arsenal.yml](.github/workflows/build-droidspaces+usb-arsenal.yml) | The whole build: a `plan` job computing the variant matrix, a matrixed `build` job, an advisory `kabi` job (CRC diff against `stock`) and a `release` job that cuts one release. Run it from the Actions tab. |
 | [local_manifests/algiz.xml](local_manifests/algiz.xml) | `repo` local manifest overlaying the five HelloVolla trees onto AOSP `common-android15-6.6`. |
 | [scripts/setup-workspace.sh](scripts/setup-workspace.sh) | `repo init` / `repo sync` + a layout sanity check. |
-| [scripts/apply-droidspaces-config.sh](scripts/apply-droidspaces-config.sh) | Idempotent, per-symbol `gki_defconfig` editor. Verifies afterwards. DroidSpaces variants only. |
-| [scripts/release-notes.sh](scripts/release-notes.sh) | Generates the GitHub release body from the variants that actually built. |
+| [scripts/apply-droidspaces-config.sh](scripts/apply-droidspaces-config.sh) | Idempotent, per-symbol `gki_defconfig` editor. Verifies afterwards. DroidSpaces only; **the current workflow inlines the same logic** (DroidSpaces + USB-Arsenal), so keep the two in sync or switch the workflow to call it. |
+| [scripts/release-notes.sh](scripts/release-notes.sh) | Release-body generator used by the old `build-kernel.yml`; the current workflow generates the notes inline. |
 | [patches/](patches/) | The three upstream SYSVIPC kABI patch variants, plus the permissive-SELinux patch. |
 | [anykernel3/anykernel.sh](anykernel3/anykernel.sh) | AnyKernel3 config for `algiz` (kernel-image-only flash). `kernel.string` is rewritten per variant at package time. |
 | [boot/](boot/README.md) | **Optional, you add this.** Supply your stock `boot.img` to also get repacked, fastboot-flashable images. |
@@ -133,15 +138,15 @@ Actions → **Build algiz kernels** → *Run workflow*.
 
 | Input | Default | Meaning |
 |---|---|---|
-| `variants` | `all` | Build all three, or just one of `droidspaces-enforcing` / `droidspaces-permissive` / `stock-permissive`. |
+| `variants` | `all` | Build all eight, or just one variant from the dropdown. |
 | `build_scope` | `image` | `image` builds only the GKI-side `Image`/`Image.lz4`/`Image.gz` + in-tree modules (~40–70 min per variant). `dist` runs the full MediaTek build with every vendor module (several hours, and you do not need it). |
 | `mode` | `user` | MTK build variant. `userdebug`/`eng` pull in `userdebug.config`/`eng.config`, which set `MTK_PANIC_ON_WARN`, `DEBUG_KMEMLEAK` and ~80 more debug symbols. Do not daily-drive those. |
 | `defconfig_overlays` | `mt6877_overlay.config` | `DEFCONFIG_OVERLAYS`, space separated. Pass the literal `none` for an empty list. |
 | `boot_img_url` | *(empty)* | Direct download URL of your **stock** `boot.img`. For `algiz` there is one attached to the [`stock-images-algiz`](https://github.com/blue-boy-questions/custom-kernel/releases/tag/stock-images-algiz) release. Alternatively commit it as `boot/boot.img`. |
 | `disable_sandbox` | off | Adds `--config=local`. Only if you hit Bazel sandbox errors. |
-| `publish_release` | on | Publish one GitHub release with every variant attached. Manual runs only — push-triggered runs never release. |
+| `publish_release` | on | Publish one GitHub release with every variant attached. Also on by default for push-triggered runs (changes under `patches/`, `scripts/`, `local_manifests/`, `anykernel3/`, `boot/` or the workflow itself). |
 
-The three variants build **in parallel**, one runner each, with `fail-fast`
+The variants build **in parallel**, one runner each, with `fail-fast`
 off: a variant that fails does not cancel or block the others, and the release
 job still publishes whatever did build (with a warning saying so).
 
@@ -168,7 +173,7 @@ artifacts are uploaded:
 
 ### Releases
 
-A successful **manual** run publishes **one** GitHub release tagged
+A successful run (manual or push to `main`) publishes **one** GitHub release tagged
 `v<kernel>-<run number>` containing every variant that built. Assets are
 prefixed with the variant they came from — `droidspaces-enforcing-Image`,
 `stock-permissive-boot.img`, and so on — except the AnyKernel3 zips, which
@@ -178,10 +183,10 @@ state (a truncated upload, which never heals). Unlike Actions artifacts, release
 assets do not expire and need no login to download. Set `publish_release` to off
 to skip it.
 
-Push-triggered runs never publish a release; they only upload Actions artifacts
-(30 days for the kernel sets, 7 for `vmlinux` and the modules). The release body
-is generated by [scripts/release-notes.sh](scripts/release-notes.sh), which is
-given the list of variants that built so it never advertises a missing asset.
+Every run uploads Actions artifacts (30 days for the kernel sets, 7 for `vmlinux`
+and the modules). The release body
+is generated inside the `release` job from the variants that actually built, so it
+never advertises a missing asset.
 
 The [`stock-images-algiz`](https://github.com/blue-boy-questions/custom-kernel/releases/tag/stock-images-algiz)
 release is not a build — it holds the **stock** `algiz` `boot.img`
@@ -297,7 +302,7 @@ independent:
    ```
 4. Flash a kernel from a release, and reboot.
 
-LKM mode works on all three variants because `CONFIG_KPROBES`,
+LKM mode works on all variants because `CONFIG_KPROBES`,
 `CONFIG_KALLSYMS_ALL`, `CONFIG_MODULES` and `CONFIG_MODULE_UNLOAD` are `=y` and
 `CONFIG_MODULE_SIG_FORCE` is off — verified in each variant's
 `build.config.resolved` before the release is cut.
