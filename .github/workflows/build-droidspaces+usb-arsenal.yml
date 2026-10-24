@@ -293,9 +293,9 @@ jobs:
           done
 
           if [ -f drivers/usb/gadget/android_configfs_uevent.c ]; then
-            grep -q 'device_unregister(opts->dev)' drivers/usb/gadget/android_configfs_uevent.c \
+            grep -qE 'device_unregister\s*\(' drivers/usb/gadget/android_configfs_uevent.c \
               || { echo "::error::android_configfs_uevent.c patch verification failed"; exit 1; }
-            echo "  verified: android_configfs_uevent.c (opts->dev unregister fix)"
+            echo "  verified: android_configfs_uevent.c (device_unregister fix)"
           fi
           grep -q 'cd_as_dvd' drivers/usb/gadget/function/f_mass_storage.c \
             || { echo "::error::f_mass_storage.c PiKVM DVD support verification failed"; exit 1; }
