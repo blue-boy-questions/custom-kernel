@@ -39,10 +39,9 @@ not boot.
 Alternatively, don't commit anything here and pass the `boot_img_url` input when
 running the workflow. A committed `boot/boot.img` takes precedence over the URL.
 
-One stock image serves all three variants: it is unpacked once per variant and
-only the kernel payload is swapped, so the release carries
-`droidspaces-enforcing-boot.img`, `droidspaces-permissive-boot.img` and
-`stock-permissive-boot.img`. Flash exactly one.
+One stock image serves every variant: it is unpacked once per variant and
+only the kernel payload is swapped, so the release carries one
+`<variant>-boot.img` per variant built. Flash exactly one.
 
 Note that a repacked `boot.img` contains **no** Magisk patch; re-patch it with
 Magisk afterwards, or just flash the AnyKernel3 zip instead (that path preserves
