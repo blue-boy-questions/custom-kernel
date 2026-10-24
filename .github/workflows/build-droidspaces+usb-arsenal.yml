@@ -1041,35 +1041,46 @@ jobs:
 
       - name: Compare symbol CRCs against stock
         run: |
-          set -uo pipefail
+          set +e   # advisory job: diff/awk exit codes must never fail the step
+          set -u
           pre="dbg/algiz-debug-${{ github.run_number }}"
           base="$pre-stock/vmlinux.symvers"
           if [ ! -f "$base" ]; then
             echo "No stock baseline in this run (build the 'stock' variant too) - skipping."
             exit 0
           fi
-          norm() { awk '{print $1, $2}' "$1" | sort; }
+          norm() { awk '{print $1, $2}' "$1" | sort -k2; }
           norm "$base" > /tmp/base.txt
           {
             echo "## kABI check vs stock"
             echo
-            echo "| Variant | CRC differences |"
-            echo "|---|---|"
+            echo "Only **changed CRC** or **removed** symbols can break stock vendor modules."
+            echo "**Added** exports (e.g. from IP_SET / USER_NS built in) are harmless."
+            echo
+            echo "| Variant | Changed CRC | Removed | Added (harmless) |"
+            echo "|---|---|---|---|"
           } >> "$GITHUB_STEP_SUMMARY"
           for d in "$pre"-*; do
             v="${d#"$pre"-}"
             [ "$v" = "stock" ] && continue
             [ -f "$d/vmlinux.symvers" ] || continue
             norm "$d/vmlinux.symvers" > /tmp/var.txt
-            n="$(diff /tmp/base.txt /tmp/var.txt | grep -c '^[<>]' || true)"
-            echo "| \`$v\` | $n |" >> "$GITHUB_STEP_SUMMARY"
-            if [ "$n" -gt 0 ]; then
-              echo "::warning::$v: $n exported-symbol CRC line(s) differ from stock (kABI drift)"
-              diff /tmp/base.txt /tmp/var.txt | head -20
+            changed="$(awk 'NR==FNR{b[$2]=$1;next} ($2 in b)&&(b[$2]!=$1){print $2}' /tmp/base.txt /tmp/var.txt)"
+            removed="$(awk 'NR==FNR{v[$2]=1;next} !($2 in v){print $2}' /tmp/var.txt /tmp/base.txt)"
+            added="$(awk 'NR==FNR{b[$2]=1;next} !($2 in b){print $2}' /tmp/base.txt /tmp/var.txt)"
+            nc="$(printf '%s' "$changed" | grep -c .)"
+            nr="$(printf '%s' "$removed" | grep -c .)"
+            na="$(printf '%s' "$added" | grep -c .)"
+            echo "| \`$v\` | $nc | $nr | $na |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$nc" -gt 0 ] || [ "$nr" -gt 0 ]; then
+              echo "::warning::$v: kABI drift vs stock - $nc changed CRC, $nr removed"
+              printf 'changed: %s\n' $changed | head -20
+              printf 'removed: %s\n' $removed | head -20
             else
-              echo "$v: kABI CRCs identical to stock"
+              echo "$v: kABI OK - no changed/removed symbols ($na added exports)"
             fi
           done
+          exit 0
 
   release:
     needs: [plan, build]
