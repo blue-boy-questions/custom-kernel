@@ -345,7 +345,7 @@ jobs:
           f="$DEVICE_MODULES_DIR/BUILD.bazel"
 
           sig() {
-            # Match `def define_mgk(` with optional leading indentation and optional
+            # Fix awk regex escaping and stale-kwarg handling (2026-10-24)
             # whitespace between `def` and the function name. Some mgk.bzl forks
             # indent the definition or use `def define_mgk =` (lambda-style), so
             # be lenient on the prefix and stop at the first closing paren.
