@@ -1,0 +1,13 @@
+# Everything in this repo is consumed by bash/patch/Bazel on a Linux CI runner.
+# Force LF so a Windows checkout can never commit CRLF: `bash\r` is not a valid
+# interpreter, and `patch` rejects CRLF context lines against an LF kernel tree.
+* text eol=lf
+
+*.patch text eol=lf
+*.sh    text eol=lf
+*.yml   text eol=lf
+*.xml   text eol=lf
+*.md    text eol=lf
+
+# Binary, never touch.
+*.img binary

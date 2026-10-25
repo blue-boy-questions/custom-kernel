@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Local manifest for Volla Phone Quintus (algiz), Volla OS 16 / Android 16, MT6877.
+  Layered on top of: repo init -u https://android.googlesource.com/kernel/manifest -b common-android15-6.6
+
+  Derived from HelloVolla/android_kernel_manifest @ volla-16.0-algiz (algiz.xml).
+  Only deviation: the upstream file declares two linkfiles in android_kernel_build_kernel
+  (build_test.sh -> build/build_test.sh and config.sh -> build/config.sh) whose sources do
+  not exist on the volla-16.0-algiz branch (both HTTP 404). They are unused by Kleaf, so
+  they are dropped here to keep `repo sync` clean.
+-->
+<manifest>
+  <remote fetch="https://github.com/HelloVolla" name="github"/>
+
+  <!-- Remove Google projects that the Volla trees replace -->
+  <remove-project name="kernel/build" />
+  <remove-project name="kernel/common" />
+
+  <!-- Kleaf build system + MediaTek "mgk" Bazel rules -->
+  <project path="build/kernel" name="android_kernel_build_kernel" remote="github" revision="volla-16.0-algiz">
+    <linkfile src="kleaf/bazel.sh" dest="tools/bazel" />
+  </project>
+  <project path="build/bazel_mgk_rules" name="android_kernel_build_bazel_mgk_rules" remote="github" revision="volla-16.0-algiz">
+    <linkfile src="kleaf/bazel.WORKSPACE" dest="WORKSPACE" />
+  </project>
+
+  <!-- Kernel sources -->
+  <project path="kernel-6.6" name="android_kernel_volla_mt6877" remote="github" revision="volla-16.0" />
+  <project path="kernel_device_modules-6.6" name="android_kernel_device_modules_volla_mt6877" remote="github" revision="volla-16.0">
+    <linkfile src="build.config.mtk_kernel_device_modules" dest="build.config" />
+  </project>
+  <project path="vendor/mediatek/kernel_modules" name="android_kernel_modules_volla_mt6877" remote="github" revision="volla-16.0" />
+</manifest>

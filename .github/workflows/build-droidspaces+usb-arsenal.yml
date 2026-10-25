@@ -1,0 +1,1404 @@
+# ------------------------------------------------------------------
+# Volla Phone Quintus (algiz) - Linux 6.6 kernel, eight variants
+#
+# Self-contained GitHub Actions workflow. It replaces the old
+# .github/workflows/build-kernel.yml (delete that file: both share the same
+# name and push trigger, and run numbers differ per workflow, so release tags
+# could collide). It builds all 8 variants for 6.6.89
+# and auto-releases them without needing to edit scripts/apply-droidspaces-config.sh
+# or scripts/release-notes.sh:
+#
+#   1. stock                             Stock gki_defconfig, SELinux enforcing.
+#   2. stock-permissive                  Stock gki_defconfig, SELinux permissive.
+#   3. droidspaces-enforcing             DroidSpaces only, SELinux enforcing.
+#   4. droidspaces-permissive            DroidSpaces only, SELinux permissive.
+#   5. usbarsenal-enforcing              USB-Arsenal only, SELinux enforcing.
+#   6. usbarsenal-permissive             USB-Arsenal only, SELinux permissive.
+#   7. droidspaces-usbarsenal-enforcing  DroidSpaces + USB-Arsenal, SELinux enforcing.
+#   8. droidspaces-usbarsenal-permissive DroidSpaces + USB-Arsenal, SELinux permissive.
+#
+# "Permissive" is NOT selinux=0: selinuxfs stays mounted and the policy is
+# still loaded (Android init requires both), but nothing is ever denied.
+#
+# Auto-release is enabled on both push to `main` and manual workflow_dispatch.
+# ------------------------------------------------------------------
+name: Build algiz kernels
+
+on:
+  workflow_dispatch:
+    inputs:
+      variants:
+        description: "Which variants to build."
+        type: choice
+        default: all
+        options:
+          - all
+          - stock
+          - stock-permissive
+          - droidspaces-enforcing
+          - droidspaces-permissive
+          - usbarsenal-enforcing
+          - usbarsenal-permissive
+          - droidspaces-usbarsenal-enforcing
+          - droidspaces-usbarsenal-permissive
+      build_scope:
+        description: "image = GKI Image only (default, kABI-safe). dist = full MediaTek dist build (all vendor modules, ~3-5h)"
+        type: choice
+        default: image
+        options: [image, dist]
+      mode:
+        description: "MTK build variant. user = production (pure gki_defconfig). userdebug/eng add MTK debug configs (PANIC_ON_WARN, KMEMLEAK) - not for daily use."
+        type: choice
+        default: user
+        options: [user, userdebug, eng]
+      defconfig_overlays:
+        description: "DEFCONFIG_OVERLAYS for the device-module side (space separated). Use the literal word none for an empty list."
+        type: string
+        default: mt6877_overlay.config
+      boot_img_url:
+        description: "Direct download URL of your STOCK boot.img. Empty = use the stock-images-algiz release asset (sha256-checked). A committed boot/boot.img always wins. A flashable boot.img is repacked per variant."
+        type: string
+        default: ""
+      droidspaces_extras:
+        description: "DroidSpaces variants only: also enable MACVLAN, CFS_BANDWIDTH (CPU limit) and CGROUP_PIDS (process limit). Turn off if the kABI job reports drift or the phone bootloops."
+        type: boolean
+        default: true
+      disable_sandbox:
+        description: "Add --config=local (disables the Bazel sandbox). Only needed if you hit sandbox errors."
+        type: boolean
+        default: false
+      publish_release:
+        description: "Publish a GitHub release with the AK3 zip and kernel images attached (enabled by default)."
+        type: boolean
+        default: true
+
+  push:
+    # branches: [main] ensures tag pushes created by the release job do not
+    # re-trigger a build loop, while every commit pushed to main builds and
+    # auto-releases all 8 variants.
+    branches: [main]
+    paths:
+      - ".github/workflows/build-droidspaces+usb-arsenal.yml"
+      - "patches/**"
+      - "scripts/**"
+      - "local_manifests/**"
+      - "anykernel3/**"
+      - "boot/**"
+
+permissions:
+  contents: read
+
+env:
+  KERNEL_DIR: kernel-6.6
+  DEVICE_MODULES_DIR: kernel_device_modules-6.6
+  PROJECT: mgk_64_k66
+  KERNEL_VERSION_NUM: "6.6"
+  KERNEL_VERSION: kernel-6.6
+  KLEAF_GKI_CHECKER: "no"
+  # Pin the upstream patch repos to a commit SHA (or tag) for reproducible builds.
+  # HEAD = latest default branch (previous behaviour).
+  DROIDSPACES_OSS_REF: "HEAD"
+  USB_ARSENAL_REF: "HEAD"
+  BAZEL_DO_NOT_DETECT_CPP_TOOLCHAIN: "1"
+  # Stock algiz boot.img attached to the stock-images-algiz release. Used when
+  # the boot_img_url input is empty (and on push-triggered runs), so every
+  # build also yields repacked, fastboot-flashable boot images.
+  DEFAULT_BOOT_IMG_URL: "https://github.com/blue-boy-questions/custom-kernel/releases/download/stock-images-algiz/boot.img"
+  DEFAULT_BOOT_IMG_SHA256: "227e34c2798893a0743da64b4ed44413b9cfda6501087596af99b781625d2720"
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.pick.outputs.matrix }}
+      count: ${{ steps.pick.outputs.count }}
+    steps:
+      - name: Decide which variants to build
+        id: pick
+        env:
+          WANT: ${{ inputs.variants || 'all' }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/all.json <<'JSON'
+          [
+            {"variant":"stock","droidspaces":false,"usbarsenal":false,"permissive":false,
+             "label":"Stock config, SELinux enforcing"},
+            {"variant":"stock-permissive","droidspaces":false,"usbarsenal":false,"permissive":true,
+             "label":"Stock config, SELinux permissive"},
+            {"variant":"droidspaces-enforcing","droidspaces":true,"usbarsenal":false,"permissive":false,
+             "label":"DroidSpaces, SELinux enforcing"},
+            {"variant":"droidspaces-permissive","droidspaces":true,"usbarsenal":false,"permissive":true,
+             "label":"DroidSpaces, SELinux permissive"},
+            {"variant":"usbarsenal-enforcing","droidspaces":false,"usbarsenal":true,"permissive":false,
+             "label":"USB-Arsenal, SELinux enforcing"},
+            {"variant":"usbarsenal-permissive","droidspaces":false,"usbarsenal":true,"permissive":true,
+             "label":"USB-Arsenal, SELinux permissive"},
+            {"variant":"droidspaces-usbarsenal-enforcing","droidspaces":true,"usbarsenal":true,"permissive":false,
+             "label":"DroidSpaces + USB-Arsenal, SELinux enforcing"},
+            {"variant":"droidspaces-usbarsenal-permissive","droidspaces":true,"usbarsenal":true,"permissive":true,
+             "label":"DroidSpaces + USB-Arsenal, SELinux permissive"}
+          ]
+          JSON
+          if [ "$WANT" = "all" ]; then
+            sel=$(jq -c '.' /tmp/all.json)
+          else
+            sel=$(jq -c --arg v "$WANT" '[.[] | select(.variant == $v)]' /tmp/all.json)
+          fi
+          n=$(jq 'length' <<<"$sel")
+          [ "$n" -gt 0 ] || { echo "::error::no variant matches '$WANT'"; exit 1; }
+          echo "matrix={\"include\":$sel}" >> "$GITHUB_OUTPUT"
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "Building $n variant(s):"
+          jq -r '.[] | "  " + .variant + " (" + .label + ")"' <<<"$sel"
+
+  build:
+    needs: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      VARIANT: ${{ matrix.variant }}
+      VARIANT_LABEL: ${{ matrix.label }}
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: recipe
+
+      - name: Reclaim disk space and pick a workspace location
+        run: |
+          set -euo pipefail
+          echo "::group::before"
+          df -h / /mnt || true
+          echo "::endgroup::"
+
+          sudo rm -rf \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/.ghcup \
+            /opt/ghc \
+            /usr/share/swift \
+            /usr/local/share/powershell \
+            /usr/local/lib/node_modules \
+            /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+
+          pick=""
+          for cand in /mnt "$RUNNER_TEMP" "$GITHUB_WORKSPACE/.."; do
+            [ -d "$cand" ] || continue
+            avail=$(df -BG --output=avail "$cand" 2>/dev/null | tail -1 | tr -dc '0-9')
+            [ -n "${avail:-}" ] || continue
+            echo "candidate $cand -> ${avail} GiB free"
+            if [ "$avail" -ge 40 ]; then pick="$cand"; break; fi
+          done
+          [ -n "$pick" ] || { echo "::error::no filesystem with >=40 GiB free"; df -h; exit 1; }
+
+          ws="$pick/algiz"
+          sudo mkdir -p "$ws"
+          sudo chown "$(id -u):$(id -g)" "$ws"
+          echo "WS=$ws" >> "$GITHUB_ENV"
+          echo "Workspace: $ws"
+
+          echo "::group::after"
+          df -h / /mnt || true
+          echo "::endgroup::"
+
+      - name: Install host build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git curl python3 rsync zip unzip lz4 zstd bc bison flex \
+            patch patchutils diffutils libssl-dev ca-certificates
+          repo_bin="$HOME/.bin"
+          mkdir -p "$repo_bin"
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o "$repo_bin/repo"
+          chmod a+x "$repo_bin/repo"
+          echo "$repo_bin" >> "$GITHUB_PATH"
+
+      - name: Sync kernel sources (repo)
+        run: |
+          set -euo pipefail
+          bash recipe/scripts/setup-workspace.sh "$WS" recipe/local_manifests/algiz.xml
+
+      - name: Apply the DroidSpaces SYSVIPC kABI patch
+        if: matrix.droidspaces
+        working-directory: ${{ env.WS }}
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          if grep -q 'ANDROID_KABI_USE(6,' include/linux/sched.h; then
+            echo "::error::ANDROID_KABI slot 6 is already used in include/linux/sched.h"
+            exit 1
+          fi
+          for slot in 6 7 8; do
+            grep -q "ANDROID_KABI_RESERVE(${slot});" include/linux/sched.h \
+              || { echo "::error::ANDROID_KABI_RESERVE(${slot}) not found in task_struct"; exit 1; }
+          done
+
+          # Fetch latest upstream Droidspaces-OSS patches as fallback if needed
+          ds_dir="/tmp/droidspaces-oss"
+          rm -rf "$ds_dir"
+          git init -q "$ds_dir" \
+            && git -C "$ds_dir" fetch -q --depth=1 https://github.com/ravindu644/Droidspaces-OSS.git "$DROIDSPACES_OSS_REF" \
+            && git -C "$ds_dir" checkout -q FETCH_HEAD || true
+
+          applied=""
+          for p in 001.GKI-below-6.12-fix_sysvipc_kabi_6_7_8.patch \
+                   001.GKI-below-6.12-fix_sysvipc_kabi_3_4_5.patch \
+                   001.GKI-below-6.12-fix_sysvipc_kabi_1_2_3.patch; do
+            pf="$GITHUB_WORKSPACE/recipe/patches/$p"
+            if [ ! -f "$pf" ] && [ -f "$ds_dir/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/$p" ]; then
+              pf="$ds_dir/Documentation/resources/kernel-patches/GKI/below-kernel-6.12/$p"
+            fi
+            [ -f "$pf" ] || continue
+            if patch -p1 --dry-run --silent < "$pf" >/dev/null 2>&1; then
+              patch -p1 < "$pf"
+              applied="$p"
+              break
+            fi
+            echo "skip (does not apply): $p"
+          done
+          [ -n "$applied" ] || { echo "::error::no SYSVIPC kABI patch applied"; exit 1; }
+          echo "Applied: $applied"
+
+          echo "::group::resulting task_struct hunks"
+          grep -n 'sysvsem\|sysvshm\|ANDROID_KABI_USE(6\|_ANDROID_KABI_REPLACE' include/linux/sched.h
+          echo "::endgroup::"
+
+          if grep -qE '^\s+struct sysv_(sem|shm)\s+sysv(sem|shm);' include/linux/sched.h; then
+            echo "::error::sysvsem/sysvshm are still live task_struct members"
+            exit 1
+          fi
+
+      - name: Apply the USB-Arsenal 6.6 kernel patches
+        if: matrix.usbarsenal
+        working-directory: ${{ env.WS }}
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+
+          ua_dir="/tmp/usb-arsenal"
+          rm -rf "$ua_dir"
+          echo "==> Fetching latest USB-Arsenal 6.6 patches from ravindu644/USB-Arsenal"
+          git init -q "$ua_dir"
+          git -C "$ua_dir" fetch -q --depth=1 https://github.com/ravindu644/USB-Arsenal.git "$USB_ARSENAL_REF"
+          git -C "$ua_dir" checkout -q FETCH_HEAD
+          echo "USB-Arsenal at $(git -C "$ua_dir" rev-parse HEAD)"
+
+          patch_dir="$ua_dir/kernel-patches/6.6"
+          if [ ! -d "$patch_dir" ] && [ -d "$GITHUB_WORKSPACE/recipe/patches/usb-arsenal" ]; then
+            patch_dir="$GITHUB_WORKSPACE/recipe/patches/usb-arsenal"
+          fi
+          [ -d "$patch_dir" ] || { echo "::error::USB-Arsenal 6.6 patch directory not found"; exit 1; }
+
+          shopt -s nullglob
+          patches=("$patch_dir"/*.patch)
+          [ "${#patches[@]}" -gt 0 ] || { echo "::error::No .patch files found in $patch_dir"; exit 1; }
+
+          for pf in "${patches[@]}"; do
+            pname="$(basename "$pf")"
+            echo "==> Applying USB-Arsenal patch: $pname"
+            if patch -p1 --dry-run --silent < "$pf" >/dev/null 2>&1; then
+              patch -p1 < "$pf"
+              echo "  applied: $pname"
+            else
+              echo "::error::USB-Arsenal patch failed dry-run: $pname"
+              patch -p1 --dry-run < "$pf" || true
+              exit 1
+            fi
+          done
+
+          if [ -f drivers/usb/gadget/android_configfs_uevent.c ]; then
+            grep -qE 'device_unregister\s*\(' drivers/usb/gadget/android_configfs_uevent.c \
+              || { echo "::error::android_configfs_uevent.c patch verification failed"; exit 1; }
+            echo "  verified: android_configfs_uevent.c (device_unregister fix)"
+          fi
+          grep -q 'cd_as_dvd' drivers/usb/gadget/function/f_mass_storage.c \
+            || { echo "::error::f_mass_storage.c PiKVM DVD support verification failed"; exit 1; }
+          echo "  verified: f_mass_storage.c (PiKVM DVD support)"
+
+      - name: Add the f_hid configurable poll-interval patch (USB-Arsenal `hid --interval`)
+        if: matrix.usbarsenal
+        working-directory: ${{ env.WS }}
+        run: |
+          set -uo pipefail
+          cd "$KERNEL_DIR"
+          f=drivers/usb/gadget/function/f_hid.c
+          [ -f "$f" ] || { echo "::warning::$f not found - HID poll interval patch skipped"; exit 0; }
+
+          has_interval() { grep -qE 'f_hid_opts_attr_interval|interval_user_set|F_HID_OPT_U\(interval' "$f"; }
+
+          if has_interval; then
+            echo "f_hid already has a configfs 'interval' attribute - nothing to do."
+            exit 0
+          fi
+
+          # 1) Any f_hid interval patch shipped anywhere in the USB-Arsenal tree
+          #    fetched by the previous step (it only applied kernel-patches/6.6/).
+          ua_dir=/tmp/usb-arsenal
+          if [ -d "$ua_dir/kernel-patches" ]; then
+            while IFS= read -r pf; do
+              grep -q 'f_hid' "$pf" && grep -qi 'interval' "$pf" || continue
+              echo "==> candidate from USB-Arsenal: ${pf#$ua_dir/}"
+              if patch -p1 --dry-run --silent < "$pf" >/dev/null 2>&1; then
+                patch -p1 < "$pf" && echo "  applied" && break
+              else
+                echo "  does not apply to this tree, skipping"
+              fi
+            done < <(find "$ua_dir/kernel-patches" -name '*.patch' | sort)
+          fi
+          if has_interval; then echo "f_hid interval support is now present."; exit 0; fi
+
+          # 2) Fall back to the two mainline commits that add it:
+          #      ea34925f5b2ee  usb: gadget: hid: allow dynamic interval configuration via configfs
+          #      7f58b4148ef5d  usb: gadget: f_hid: fix SuperSpeed descriptors
+          #    Both are applied only if they dry-run cleanly; this is a best-effort
+          #    backport onto 6.6, and the feature is optional, so a miss never
+          #    fails the build.
+          echo "==> falling back to the mainline f_hid commits"
+          fetch_commit() {
+            curl -fsSL --retry 3 "https://github.com/torvalds/linux/commit/$1.patch" -o "/tmp/$2.patch" 2>/dev/null
+          }
+          if fetch_commit ea34925f5b2ee f_hid_interval && grep -q 'dynamic interval configuration' /tmp/f_hid_interval.patch; then
+            # keep only the f_hid.c / u_hid.h hunks (drop Documentation/)
+            filterdiff -i '*/drivers/usb/gadget/function/*' /tmp/f_hid_interval.patch > /tmp/f_hid_interval.code.patch 2>/dev/null \
+              || cp /tmp/f_hid_interval.patch /tmp/f_hid_interval.code.patch
+            if patch -p1 --dry-run --silent < /tmp/f_hid_interval.code.patch >/dev/null 2>&1; then
+              patch -p1 < /tmp/f_hid_interval.code.patch
+              echo "  applied ea34925f5b2ee"
+              if fetch_commit 7f58b4148ef5d8ee0fb7d8113dcc38ff5374babc f_hid_ss && grep -q 'SuperSpeed descriptors' /tmp/f_hid_ss.patch \
+                 && patch -p1 --dry-run --silent < /tmp/f_hid_ss.patch >/dev/null 2>&1; then
+                patch -p1 < /tmp/f_hid_ss.patch && echo "  applied 7f58b4148ef5d (SuperSpeed fix)"
+              else
+                echo "::warning::SuperSpeed follow-up not applied (not needed for a high-speed-only port)"
+              fi
+            else
+              echo "::warning::mainline f_hid interval patch does not apply to this 6.6 tree"
+              patch -p1 --dry-run < /tmp/f_hid_interval.code.patch | tail -20 || true
+            fi
+          else
+            echo "::warning::could not download the mainline f_hid interval commit"
+          fi
+
+          if has_interval; then
+            echo "f_hid interval support is now present."
+          else
+            echo "::warning::HID poll interval patch NOT applied - 'usb-arsenal hid --interval' will not work (everything else is unaffected)."
+          fi
+          exit 0
+
+      - name: Apply the DroidSpaces & USB-Arsenal defconfig fragments
+        if: matrix.droidspaces || matrix.usbarsenal
+        working-directory: ${{ env.WS }}
+        env:
+          ENABLE_DROIDSPACES: ${{ matrix.droidspaces }}
+          ENABLE_USBARSENAL: ${{ matrix.usbarsenal }}
+          ENABLE_EXTRAS: ${{ github.event_name != 'workflow_dispatch' || inputs.droidspaces_extras }}
+        run: |
+          set -euo pipefail
+          DEFCONFIG="$KERNEL_DIR/arch/arm64/configs/gki_defconfig"
+          GADGET_KCONFIG="$KERNEL_DIR/drivers/usb/gadget/Kconfig"
+          [ -f "$DEFCONFIG" ] || { echo "::error::no such file: $DEFCONFIG"; exit 1; }
+
+          DS_SYMBOLS=(
+            SYSVIPC
+            POSIX_MQUEUE
+            IPC_NS
+            PID_NS
+            DEVTMPFS
+            NETFILTER_XT_MATCH_ADDRTYPE
+            USER_NS
+            IP6_NF_NAT
+            IP6_NF_TARGET_MASQUERADE
+            IP_NF_TARGET_REJECT
+            IP6_NF_TARGET_REJECT
+            NETFILTER_XT_TARGET_LOG
+            NETFILTER_XT_MATCH_RECENT
+            IP_SET
+            IP_SET_HASH_IP
+            IP_SET_HASH_NET
+            NETFILTER_XT_SET
+            TMPFS_POSIX_ACL
+            TMPFS_XATTR
+          )
+
+          # Optional DroidSpaces features reported by its Requirements Check:
+          #   Macvlan support      -> CONFIG_MACVLAN
+          #   CPU limit support    -> CONFIG_CFS_BANDWIDTH (needs FAIR_GROUP_SCHED
+          #                           and CGROUP_SCHED; gives cpu.max)
+          #   Process limit support-> CONFIG_CGROUP_PIDS (pids.max)
+          # kABI note: MACVLAN and CFS_BANDWIDTH only touch private structs.
+          # CGROUP_PIDS adds SUBSYS(pids) to cgroup_subsys.h, which grows
+          # CGROUP_SUBSYS_COUNT (and so struct cgroup / css_set arrays) and shifts
+          # the IDs of rdma/misc/debug if they are enabled. The advisory `kabi`
+          # job shows whether any exported CRC changed; if it does, re-run with
+          # the droidspaces_extras input off.
+          DS_EXTRA_SYMBOLS=(
+            MACVLAN
+            CGROUP_SCHED
+            FAIR_GROUP_SCHED
+            CFS_BANDWIDTH
+            CGROUP_PIDS
+          )
+          echo "$ENABLE_EXTRAS" > "$WS/ds-extras.txt"
+
+          UA_SYMBOL_CANDIDATES=(
+            "USB_GADGET"
+            "USB_CONFIGFS"
+            "USB_CONFIGFS_UEVENT"
+            "USB_CONFIGFS_SERIAL:USB_CONFIGFS_F_SERIAL"
+            "USB_CONFIGFS_ACM:USB_CONFIGFS_F_ACM"
+            "USB_CONFIGFS_OBEX:USB_CONFIGFS_F_OBEX"
+            "USB_CONFIGFS_NCM:USB_CONFIGFS_F_NCM"
+            "USB_CONFIGFS_ECM:USB_CONFIGFS_F_ECM"
+            "USB_CONFIGFS_ECM_SUBSET:USB_CONFIGFS_F_SUBSET"
+            "USB_CONFIGFS_RNDIS:USB_CONFIGFS_F_RNDIS"
+            "USB_CONFIGFS_EEM:USB_CONFIGFS_F_EEM"
+            "USB_CONFIGFS_MASS_STORAGE:USB_CONFIGFS_F_MASS_STORAGE"
+            "USB_CONFIGFS_F_LB_SS"
+            "USB_CONFIGFS_F_FS"
+            "USB_CONFIGFS_F_ACC"
+            "USB_CONFIGFS_F_AUDIO_SRC"
+            "USB_CONFIGFS_F_UAC1"
+            "USB_CONFIGFS_F_UAC2"
+            "USB_CONFIGFS_F_MIDI"
+            "USB_CONFIGFS_F_HID"
+            "USB_CONFIGFS_F_UVC"
+            "USB_CONFIGFS_F_PRINTER:USB_CONFIGFS_F_PRN"
+            "USB_CONFIGFS_MBIM:USB_CONFIGFS_F_MBIM"
+          )
+
+          UA_SYMBOLS=()
+          if [ "$ENABLE_USBARSENAL" = "true" ]; then
+            for entry in "${UA_SYMBOL_CANDIDATES[@]}"; do
+              IFS=':' read -r primary alias <<< "$entry"
+              if [ -f "$GADGET_KCONFIG" ]; then
+                if grep -qE "^config ${primary}\b" "$GADGET_KCONFIG"; then
+                  UA_SYMBOLS+=("$primary")
+                elif [ -n "${alias:-}" ] && grep -qE "^config ${alias}\b" "$GADGET_KCONFIG"; then
+                  UA_SYMBOLS+=("$alias")
+                else
+                  echo "  skip  CONFIG_${primary} (not in drivers/usb/gadget/Kconfig)"
+                fi
+              else
+                UA_SYMBOLS+=("$primary")
+              fi
+            done
+          fi
+
+          cp -f "$DEFCONFIG" "${DEFCONFIG}.orig.bak"
+
+          apply_symbol_group() {
+            local group_label="$1"
+            shift
+            local symbols=("$@")
+            local flipped=0 appended=0 kept=0
+            local appended_list=()
+
+            echo "==> Applying ${group_label} symbols"
+            for sym in "${symbols[@]}"; do
+              key="CONFIG_${sym}"
+              if grep -qx -- "${key}=y" "$DEFCONFIG"; then
+                printf '  keep   %s=y\n' "$key"
+                kept=$((kept + 1))
+              elif grep -qx -- "# ${key} is not set" "$DEFCONFIG"; then
+                sed -i "s|^# ${key} is not set\$|${key}=y|" "$DEFCONFIG"
+                printf '  flip   # %s is not set  ->  %s=y\n' "$key" "$key"
+                flipped=$((flipped + 1))
+              elif grep -qE "^${key}=" "$DEFCONFIG"; then
+                old="$(grep -E "^${key}=" "$DEFCONFIG" | head -1)"
+                sed -i "s|^${key}=.*\$|${key}=y|" "$DEFCONFIG"
+                printf '  set    %s  ->  %s=y\n' "$old" "$key"
+                flipped=$((flipped + 1))
+              else
+                appended_list+=("$key")
+              fi
+            done
+
+            if [ "${#appended_list[@]}" -gt 0 ]; then
+              [ -n "$(tail -c 1 "$DEFCONFIG")" ] && printf '\n' >> "$DEFCONFIG"
+              printf '\n# --- %s ---\n' "$group_label" >> "$DEFCONFIG"
+              for key in "${appended_list[@]}"; do
+                printf '%s=y\n' "$key" >> "$DEFCONFIG"
+                printf '  append %s=y\n' "$key"
+                appended=$((appended + 1))
+              done
+            fi
+            echo "==> ${group_label}: ${kept} kept, ${flipped} flipped, ${appended} appended"
+          }
+
+          bad=0
+          if [ "$ENABLE_DROIDSPACES" = "true" ]; then
+            apply_symbol_group "DroidSpaces (GKI-exclusive, kABI-safe)" "${DS_SYMBOLS[@]}"
+            for sym in "${DS_SYMBOLS[@]}"; do
+              grep -qx -- "CONFIG_${sym}=y" "$DEFCONFIG" || { echo "  FAIL CONFIG_${sym}"; bad=1; }
+            done
+          fi
+
+          if [ "$ENABLE_DROIDSPACES" = "true" ] && [ "$ENABLE_EXTRAS" = "true" ]; then
+            apply_symbol_group "DroidSpaces extras (macvlan, CPU limit, process limit)" "${DS_EXTRA_SYMBOLS[@]}"
+            for sym in "${DS_EXTRA_SYMBOLS[@]}"; do
+              grep -qx -- "CONFIG_${sym}=y" "$DEFCONFIG" || { echo "  FAIL CONFIG_${sym}"; bad=1; }
+            done
+          fi
+
+          if [ "$ENABLE_USBARSENAL" = "true" ]; then
+            apply_symbol_group "USB-Arsenal (ConfigFS USB Gadget support)" "${UA_SYMBOLS[@]}"
+            for sym in "${UA_SYMBOLS[@]}"; do
+              grep -qx -- "CONFIG_${sym}=y" "$DEFCONFIG" || { echo "  FAIL CONFIG_${sym}"; bad=1; }
+            done
+          fi
+
+          printf '%s\n' "${UA_SYMBOLS[@]:-}" | sed '/^$/d' > "$WS/ua-symbols.txt"
+          diff -u "${DEFCONFIG}.orig.bak" "$DEFCONFIG" || true
+          rm -f "${DEFCONFIG}.orig.bak"
+          [ "$bad" -eq 0 ] || { echo "::error::defconfig verification failed"; exit 1; }
+
+      - name: Make SELinux permanently permissive
+        if: matrix.permissive
+        working-directory: ${{ env.WS }}
+        run: |
+          set -euo pipefail
+          cd "$KERNEL_DIR"
+          h=security/selinux/include/security.h
+          pf="$GITHUB_WORKSPACE/recipe/patches/002.selinux-permanently-permissive.patch"
+
+          grep -qx 'CONFIG_SECURITY_SELINUX_DEVELOP=y' arch/arm64/configs/gki_defconfig \
+            || awk '/^config SECURITY_SELINUX_DEVELOP/{f=1;next} /^config /{f=0} f&&/default y/{ok=1} END{exit !ok}' security/selinux/Kconfig \
+            || { echo "::error::SECURITY_SELINUX_DEVELOP is not enabled; the patch would be dead code"; exit 1; }
+
+          patch -p1 --dry-run --silent < "$pf" \
+            || { echo "::error::002.selinux-permanently-permissive.patch does not apply to $h"; exit 1; }
+          patch -p1 < "$pf"
+
+          echo "::group::enforcing_enabled() after patching"
+          sed -n '/^#ifdef CONFIG_SECURITY_SELINUX_DEVELOP/,/^#else$/p' "$h"
+          echo "::endgroup::"
+
+          awk '/^#ifdef CONFIG_SECURITY_SELINUX_DEVELOP$/{f=1} f{print} /^#else$/{if(f)exit}' "$h" \
+            > /tmp/develop-branch.txt
+          grep -q 'return false;' /tmp/develop-branch.txt \
+            || { echo "::error::enforcing_enabled() does not return false after patching"; exit 1; }
+          grep -q 'WRITE_ONCE(selinux_state.enforcing, value);' /tmp/develop-branch.txt \
+            || { echo "::error::enforcing_set() was altered; setenforce would stop working"; exit 1; }
+          echo "SELinux is now permanently permissive (selinuxfs and policy load untouched)."
+
+      - name: Neutralize check_defconfig on the GKI-side build config
+        if: matrix.droidspaces || matrix.usbarsenal
+        working-directory: ${{ env.WS }}
+        run: |
+          set -euo pipefail
+          f="$KERNEL_DIR/build.config.gki"
+          cp -f "$f" "$f.orig"
+          sed -i 's|^POST_DEFCONFIG_CMDS="check_defconfig"$|POST_DEFCONFIG_CMDS=""|' "$f"
+          grep -q '^POST_DEFCONFIG_CMDS=""$' "$f" \
+            || { echo "::error::failed to blank POST_DEFCONFIG_CMDS in $f"; cat "$f"; exit 1; }
+          diff -u "$f.orig" "$f" || true
+          rm -f "$f.orig"
+
+      - name: Reconcile the define_mgk() call with the algiz mgk.bzl signature
+        working-directory: ${{ env.WS }}
+        run: |
+          set -euo pipefail
+          mgk="build/bazel_mgk_rules/mgk.bzl"
+          f="$DEVICE_MODULES_DIR/BUILD.bazel"
+
+          sig() {
+            # Match `def define_mgk(` with optional leading indentation and optional
+            # whitespace between `def` and the function name.
+            awk '/def[[:space:]]+define_mgk\(/{f=1} f{print} f && /\):[[:space:]]*$/{exit}' "$mgk" \
+              | sed -n 's/^[[:space:]]*\([a-z_][a-z_0-9]*\)[[:space:]]*[,=:)].*/\1/p' \
+              | sort -u
+          }
+          kwargs() {
+            awk '/^define_mgk\(/{f=1;next} /^\)/{f=0} f' "$f" \
+              | sed -n 's/^[[:space:]]*\([a-z_][a-z_0-9]*\)[[:space:]]*=.*/\1/p' \
+              | sort -u
+          }
+
+          sig > /tmp/mgk.sig
+          kwargs > /tmp/mgk.kw
+          echo "define_mgk() accepts $(wc -l < /tmp/mgk.sig) params; call passes $(wc -l < /tmp/mgk.kw) kwargs"
+
+          extra="$(comm -23 /tmp/mgk.kw /tmp/mgk.sig || true)"
+          if [ -z "$extra" ]; then
+            echo "No stale kwargs - the trees agree, nothing to do."
+            exit 0
+          fi
+          echo "Stale kwargs in $f:"; printf '  %s\n' $extra
+
+          for k in $extra; do
+            case "$k" in
+              dtb_files) ;;
+              *) echo "::warning::stale kwarg '$k' not in define_mgk() signature - removing";;
+            esac
+            n="$(grep -c "^[[:space:]]*${k}[[:space:]]*=.*,[[:space:]]*$" "$f" || true)"
+            [ "$n" = "1" ] || { echo "::warning::'$k' is not a single-line kwarg ($n matches), skipping"; continue; }
+            grep -n "^[[:space:]]*${k}[[:space:]]*=" "$f"
+            sed -i "/^[[:space:]]*${k}[[:space:]]*=.*,[[:space:]]*$/d" "$f"
+            echo "removed: $k"
+          done
+
+          kwargs > /tmp/mgk.kw2
+          left="$(comm -23 /tmp/mgk.kw2 /tmp/mgk.sig || true)"
+          [ -z "$left" ] || { echo "::warning::stale kwargs remain (multi-line, could not auto-remove): $left"; }
+          tail -4 "$f"
+          grep -q '^)' "$f" || { echo "::error::define_mgk() call is no longer closed"; exit 1; }
+
+      - name: Build
+        working-directory: ${{ env.WS }}
+        env:
+          MODE: ${{ inputs.mode || 'user' }}
+          BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
+          DEFCONFIG_OVERLAYS: ${{ inputs.defconfig_overlays || 'mt6877_overlay.config' }}
+          SANDBOX_OFF: ${{ inputs.disable_sandbox && '1' || '' }}
+        run: |
+          set -euo pipefail
+
+          [ "$DEFCONFIG_OVERLAYS" = "none" ] && DEFCONFIG_OVERLAYS=""
+
+          export KERNEL_VERSION DEFCONFIG_OVERLAYS
+          export SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(date -u +%s)}"
+          export PATH="$PWD/prebuilts/jdk/jdk11/linux-x86/bin:$PATH"
+
+          OUT_DIR="$PWD/out"
+          mkdir -p "$OUT_DIR"
+
+          startup=(
+            "--output_user_root=$OUT_DIR"
+            "--output_base=$OUT_DIR/bazel/output_user_root/output_base"
+          )
+          args=(
+            --experimental_writable_outputs
+            --noenable_bzlmod
+            "--//build/bazel_mgk_rules:kernel_version=$KERNEL_VERSION_NUM"
+            --nokmi_symbol_list_violations_check
+          )
+          [ -n "$SANDBOX_OFF" ] && args+=(--config=local)
+
+          echo "MODE=$MODE  BUILD_SCOPE=$BUILD_SCOPE  DEFCONFIG_OVERLAYS=$DEFCONFIG_OVERLAYS"
+
+          if [ "$BUILD_SCOPE" = "dist" ]; then
+            target="//$DEVICE_MODULES_DIR:${PROJECT}_customer_modules_install.$MODE"
+            dist="//$DEVICE_MODULES_DIR:${PROJECT}_customer_dist.$MODE"
+            tools/bazel "${startup[@]}" build "${args[@]}" "$target"
+            tools/bazel "${startup[@]}" run   "${args[@]}" "$dist" -- --dist_dir="$OUT_DIR/dist"
+          else
+            target="//$DEVICE_MODULES_DIR:${PROJECT}_kernel_aarch64.$MODE"
+            tools/bazel "${startup[@]}" build "${args[@]}" "$target"
+          fi
+
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: algiz-logs-${{ github.run_number }}-${{ matrix.variant }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ env.WS }}/out/bazel/output_user_root/output_base/command.log
+            ${{ env.WS }}/out/bazel/output_user_root/output_base/*.log
+
+      - name: Collect kernel artifacts
+        working-directory: ${{ env.WS }}
+        env:
+          MODE: ${{ inputs.mode || 'user' }}
+          BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
+        run: |
+          set -euo pipefail
+          OUT_DIR="$PWD/out"
+          art="$PWD/artifacts"
+          mkdir -p "$art"
+
+          tgt="${PROJECT}_kernel_aarch64.$MODE"
+
+          searchdirs=(
+            "$OUT_DIR/dist"
+            "$PWD/bazel-bin/$DEVICE_MODULES_DIR/$tgt"
+          )
+          while IFS= read -r d; do searchdirs+=("$d"); done < <(
+            find "$OUT_DIR/bazel/output_user_root/output_base/execroot" \
+              -maxdepth 5 -type d -name bin 2>/dev/null
+          )
+          srcdir=""
+          for cand in "${searchdirs[@]}"; do
+            [ -e "$cand" ] || continue
+            found="$(find -L "$cand" -maxdepth 4 -type f -name Image 2>/dev/null | head -1 || true)"
+            if [ -n "$found" ]; then srcdir="$(dirname "$found")"; break; fi
+          done
+          [ -n "$srcdir" ] || { echo "::error::no Image found; searched dist/, bazel-bin/ and the execroot"; exit 1; }
+          echo "Artifacts from: $srcdir"
+
+          for f in Image Image.lz4 Image.gz System.map vmlinux.symvers \
+                   modules.builtin modules.builtin.modinfo; do
+            [ -f "$srcdir/$f" ] && cp -f "$srcdir/$f" "$art/"
+          done
+          if [ -f "$srcdir/vmlinux" ]; then
+            zstd -q -T0 -19 -o "$art/vmlinux.zst" "$srcdir/vmlinux" 2>/dev/null \
+              || zstd -q -T0 -o "$art/vmlinux.zst" "$srcdir/vmlinux"
+          fi
+          [ -f "$art/Image" ] || { echo "::error::Image missing after copy"; exit 1; }
+
+          if [ "$BUILD_SCOPE" = "dist" ]; then
+            mkdir -p "$art/modules"
+            find -L "$OUT_DIR/dist" -type f -name '*.ko' -exec cp -f {} "$art/modules/" \; 2>/dev/null || true
+            echo "modules collected: $(ls -1 "$art/modules" 2>/dev/null | wc -l)"
+          fi
+
+          echo "SRCDIR=$srcdir" >> "$GITHUB_ENV"
+          echo "ART=$art" >> "$GITHUB_ENV"
+          echo "::group::artifacts"
+          ls -lh "$art"
+          echo "::endgroup::"
+
+      - name: Locate and archive the built .config
+        working-directory: ${{ env.WS }}
+        env:
+          MODE: ${{ inputs.mode || 'user' }}
+        run: |
+          set -euo pipefail
+          OUT_DIR="$PWD/out"
+
+          cfg=""
+          cfg="$(find -L "$OUT_DIR/bazel/output_user_root/output_base/execroot" \
+                   -path "*${PROJECT}_kernel_aarch64.${MODE}_config/out_dir/.config" \
+                   2>/dev/null | head -1 || true)"
+          if [ -z "$cfg" ] && [ -f "$SRCDIR/vmlinux" ]; then
+            "$KERNEL_DIR/scripts/extract-ikconfig" "$SRCDIR/vmlinux" > /tmp/built.config
+            cfg=/tmp/built.config
+          fi
+          [ -n "$cfg" ] || { echo "::error::could not locate the built .config"; exit 1; }
+          echo "Using .config: $cfg"
+          cp -f "$cfg" "$ART/build.config.resolved"
+          echo "CFG=$ART/build.config.resolved" >> "$GITHUB_ENV"
+
+      - name: Verify the DroidSpaces & USB-Arsenal options
+        if: matrix.droidspaces || matrix.usbarsenal
+        working-directory: ${{ env.WS }}
+        env:
+          DROIDSPACES: ${{ matrix.droidspaces }}
+          USBARSENAL: ${{ matrix.usbarsenal }}
+        run: |
+          set -euo pipefail
+          cfg="$CFG"
+          fail=0
+
+          if [ "$DROIDSPACES" = "true" ]; then
+            echo "== DroidSpaces GKI-exclusive options =="
+            for s in SYSVIPC POSIX_MQUEUE IPC_NS PID_NS DEVTMPFS \
+                     NETFILTER_XT_MATCH_ADDRTYPE USER_NS \
+                     IP6_NF_NAT IP6_NF_TARGET_MASQUERADE \
+                     IP_NF_TARGET_REJECT IP6_NF_TARGET_REJECT \
+                     NETFILTER_XT_TARGET_LOG \
+                     NETFILTER_XT_MATCH_RECENT \
+                     IP_SET IP_SET_HASH_IP IP_SET_HASH_NET NETFILTER_XT_SET \
+                     TMPFS_POSIX_ACL TMPFS_XATTR; do
+              v="$(sed -n "s/^CONFIG_${s}=//p" "$cfg" | head -1)"
+              case "$v" in
+                y) printf '  ok    CONFIG_%s=y\n' "$s" ;;
+                m) printf '  ok    CONFIG_%s=m (module, loadable)\n' "$s" ;;
+                *) printf '  FAIL  CONFIG_%s not enabled\n' "$s"; fail=1 ;;
+              esac
+            done
+
+            echo "== DroidSpaces fatal-if-missing options =="
+            for s in NAMESPACES UTS_NS IPC_NS PID_NS DEVTMPFS; do
+              if grep -qx "CONFIG_${s}=y" "$cfg"; then
+                printf '  ok    CONFIG_%s=y\n' "$s"
+              else
+                printf '  FAIL  CONFIG_%s missing (DroidSpaces check will refuse to run)\n' "$s"
+                fail=1
+              fi
+            done
+
+            if grep -qx "CONFIG_CGROUP_DEVICE=y" "$cfg"; then
+              echo "  note  CONFIG_CGROUP_DEVICE=y (from the vendor config)"
+            else
+              echo "  note  CONFIG_CGROUP_DEVICE not set - intentional, see comment"
+            fi
+
+            echo "== recommended by the DroidSpaces runtime check =="
+            for s in EPOLL SIGNALFD BLK_DEV_LOOP EXT4_FS CGROUPS CGROUP_PIDS \
+                     CGROUP_SCHED MEMCG SECCOMP SECCOMP_FILTER OVERLAY_FS \
+                     FUSE_FS NET_NS BRIDGE VETH IPV6 KEYS; do
+              v="$(sed -n "s/^CONFIG_${s}=//p" "$cfg" | head -1)"
+              if [ -n "$v" ]; then
+                printf '  have  CONFIG_%s=%s\n' "$s" "$v"
+              else
+                printf '  MISS  CONFIG_%s (optional/recommended only)\n' "$s"
+              fi
+            done
+          fi
+
+          if [ "$DROIDSPACES" = "true" ] && [ "$(cat "$WS/ds-extras.txt" 2>/dev/null)" = "true" ]; then
+            echo "== DroidSpaces extras (macvlan / CPU limit / process limit) =="
+            for s in MACVLAN CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH CGROUP_PIDS; do
+              v="$(sed -n "s/^CONFIG_${s}=//p" "$cfg" | head -1)"
+              case "$v" in
+                y|m) printf '  ok    CONFIG_%s=%s\n' "$s" "$v" ;;
+                *)   printf '  FAIL  CONFIG_%s not enabled (dropped by olddefconfig? check dependencies)\n' "$s"; fail=1 ;;
+              esac
+            done
+          fi
+
+          if [ "$USBARSENAL" = "true" ]; then
+            echo "== USB-Arsenal HID poll interval (f_hid patch) =="
+            if grep -qE 'f_hid_opts_attr_interval|interval_user_set|F_HID_OPT_U\(interval' \
+                 "$KERNEL_DIR/drivers/usb/gadget/function/f_hid.c"; then
+              echo "  ok    f_hid exposes the configfs 'interval' attribute"
+            else
+              echo "  WARN  f_hid has no 'interval' attribute - 'usb-arsenal hid --interval' will not work"
+            fi
+            echo "== USB-Arsenal core Gadget & ConfigFS options =="
+            # Verify exactly what the apply step enabled (it skips symbols absent
+            # from this tree's Kconfig and may use their aliases), not a fixed list.
+            [ -s "$WS/ua-symbols.txt" ] || { echo "  FAIL ua-symbols.txt missing/empty"; fail=1; }
+            while read -r s; do
+              [ -n "$s" ] || continue
+              v="$(sed -n "s/^CONFIG_${s}=//p" "$cfg" | head -1)"
+              case "$v" in
+                y) printf '  ok    CONFIG_%s=y\n' "$s" ;;
+                m) printf '  ok    CONFIG_%s=m (module, loadable)\n' "$s" ;;
+                *) printf '  FAIL  CONFIG_%s not enabled (dropped by olddefconfig? check dependencies)\n' "$s"; fail=1 ;;
+              esac
+            done < "$WS/ua-symbols.txt"
+
+            echo "== USB-Arsenal extended Gadget functions =="
+            for s in USB_CONFIGFS_F_LB_SS USB_CONFIGFS_F_AUDIO_SRC \
+                     USB_CONFIGFS_F_UAC1 USB_CONFIGFS_F_UAC2 \
+                     USB_CONFIGFS_F_MIDI USB_CONFIGFS_F_UVC \
+                     USB_CONFIGFS_F_PRINTER; do
+              v="$(sed -n "s/^CONFIG_${s}=//p" "$cfg" | head -1)"
+              if [ -n "$v" ]; then
+                printf '  have  CONFIG_%s=%s\n' "$s" "$v"
+              else
+                printf '  note  CONFIG_%s not enabled in resolved .config\n' "$s"
+              fi
+            done
+          fi
+
+          echo "== kABI / module-loading guarantees =="
+          for s in MODVERSIONS MODULE_SIG_PROTECT; do
+            if grep -qx "CONFIG_${s}=y" "$cfg"; then
+              printf '  ok    CONFIG_%s=y\n' "$s"
+            else
+              printf '  WARN  CONFIG_%s not set - stock vendor modules may be rejected\n' "$s"
+            fi
+          done
+          grep -m1 '^CONFIG_LOCALVERSION=' "$cfg" || true
+
+          [ "$fail" -eq 0 ] || { echo "::error::the built .config does not satisfy the requested features"; exit 1; }
+
+      - name: Verify the SELinux and root-related options
+        working-directory: ${{ env.WS }}
+        env:
+          PERMISSIVE: ${{ matrix.permissive }}
+        run: |
+          set -euo pipefail
+          cfg="$CFG"
+          fail=0
+
+          if grep -qx 'CONFIG_SECURITY_SELINUX_DEVELOP=y' "$cfg"; then
+            echo "  ok    CONFIG_SECURITY_SELINUX_DEVELOP=y (the patched branch is the compiled one)"
+          elif [ "$PERMISSIVE" = "true" ]; then
+            echo "  FAIL  CONFIG_SECURITY_SELINUX_DEVELOP is not =y - the permissive patch is dead code"
+            fail=1
+          else
+            echo "  note  CONFIG_SECURITY_SELINUX_DEVELOP not =y"
+          fi
+
+          if [ "$PERMISSIVE" = "true" ]; then
+            echo "  info  SELinux is permissive by patch (asserted at source level before the build)"
+          else
+            echo "  info  SELinux left stock (enforcing)"
+          fi
+
+          echo "== KernelSU LKM prerequisites (root is added by you, not by this kernel) =="
+          for s in KPROBES KALLSYMS_ALL MODULES MODULE_UNLOAD; do
+            if grep -qx "CONFIG_${s}=y" "$cfg"; then
+              printf '  ok    CONFIG_%s=y\n' "$s"
+            else
+              printf '  WARN  CONFIG_%s not =y - KernelSU LKM mode may not work\n' "$s"
+            fi
+          done
+          if grep -qx 'CONFIG_MODULE_SIG_FORCE=y' "$cfg"; then
+            echo "  WARN  CONFIG_MODULE_SIG_FORCE=y - unsigned kernelsu.ko would be rejected"
+          else
+            echo "  ok    CONFIG_MODULE_SIG_FORCE not set - unsigned modules can load"
+          fi
+
+          echo "== kABI / module-loading guarantees =="
+          for s in MODVERSIONS MODULE_SIG_PROTECT; do
+            if grep -qx "CONFIG_${s}=y" "$cfg"; then
+              printf '  ok    CONFIG_%s=y\n' "$s"
+            else
+              printf '  WARN  CONFIG_%s not set - stock vendor modules may be rejected\n' "$s"
+            fi
+          done
+          grep -m1 '^CONFIG_LOCALVERSION=' "$cfg" || true
+
+          [ "$fail" -eq 0 ] || { echo "::error::the built .config does not match the requested variant"; exit 1; }
+
+      - name: Package the AnyKernel3 zip
+        working-directory: ${{ env.WS }}
+        env:
+          MODE: ${{ inputs.mode || 'user' }}
+          BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
+          DROIDSPACES: ${{ matrix.droidspaces }}
+          USBARSENAL: ${{ matrix.usbarsenal }}
+          PERMISSIVE: ${{ matrix.permissive }}
+        run: |
+          set -euo pipefail
+          ak="$PWD/ak3"
+          rm -rf "$ak"
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 "$ak"
+          rm -rf "$ak/.git" "$ak/.github" "$ak/README.md" \
+                 "$ak/ramdisk" "$ak/patch" "$ak/modules"
+          mkdir -p "$ak/ramdisk" "$ak/patch" "$ak/modules"
+          touch "$ak/ramdisk/.gitkeep" "$ak/patch/.gitkeep" "$ak/modules/.gitkeep"
+
+          cp -f "$GITHUB_WORKSPACE/recipe/anykernel3/anykernel.sh" "$ak/anykernel.sh"
+
+          sed -i "s|^kernel\.string=.*|kernel.string=Volla Quintus (algiz) ${VARIANT_LABEL}|" \
+            "$ak/anykernel.sh"
+          grep '^kernel.string=' "$ak/anykernel.sh"
+
+          cp -f "$ART/Image" "$ak/Image"
+
+          sver="$(sed -n 's/^CONFIG_LOCALVERSION="\(.*\)"$/\1/p' \
+                   "$KERNEL_DIR/arch/arm64/configs/gki_defconfig" | head -1)"
+          kver="$(sed -n 's/^VERSION = //p' "$KERNEL_DIR/Makefile" | head -1).$(sed -n 's/^PATCHLEVEL = //p' "$KERNEL_DIR/Makefile" | head -1).$(sed -n 's/^SUBLEVEL = //p' "$KERNEL_DIR/Makefile" | head -1)"
+          zipname="AK3-algiz-${VARIANT}-${kver}${sver}-${MODE}-$(date -u +%Y%m%d).zip"
+
+          ( cd "$ak" && zip -r9 "$ART/$zipname" . -x '.git*' >/dev/null )
+          echo "ZIPNAME=$zipname" >> "$GITHUB_ENV"
+          echo "KVER=${kver}${sver}" >> "$GITHUB_ENV"
+          ls -lh "$ART/$zipname"
+
+          cat > "$ART/variant.json" <<JSON
+          {
+            "variant": "${VARIANT}",
+            "label": "${VARIANT_LABEL}",
+            "droidspaces": ${DROIDSPACES},
+            "usbarsenal": ${USBARSENAL},
+            "permissive": ${PERMISSIVE},
+            "kver": "${kver}${sver}",
+            "zipname": "${zipname}",
+            "mode": "${MODE}",
+            "scope": "${BUILD_SCOPE}"
+          }
+          JSON
+          jq -e . "$ART/variant.json" > /dev/null
+
+      - name: Repack boot.img (only when a stock boot.img is supplied)
+        working-directory: ${{ env.WS }}
+        env:
+          BOOT_IMG_URL: ${{ inputs.boot_img_url }}
+        run: |
+          set -euo pipefail
+          stock=""
+          if [ -f "$GITHUB_WORKSPACE/recipe/boot/boot.img" ]; then
+            stock="$GITHUB_WORKSPACE/recipe/boot/boot.img"
+            echo "Using committed boot/boot.img"
+          elif [ -n "${BOOT_IMG_URL:-}" ]; then
+            echo "Downloading stock boot.img from the boot_img_url input"
+            curl -fsSL --retry 3 "$BOOT_IMG_URL" -o /tmp/stock-boot.img
+            stock=/tmp/stock-boot.img
+          else
+            # Nothing supplied: use the stock image attached to the
+            # stock-images-algiz release, and refuse anything that is not
+            # byte-identical to the documented one.
+            echo "Downloading the default stock boot.img (stock-images-algiz release)"
+            if curl -fsSL --retry 3 "$DEFAULT_BOOT_IMG_URL" -o /tmp/stock-boot.img; then
+              got="$(sha256sum /tmp/stock-boot.img | cut -d' ' -f1)"
+              if [ "$got" != "$DEFAULT_BOOT_IMG_SHA256" ]; then
+                echo "::error::default stock boot.img sha256 mismatch (got $got, want $DEFAULT_BOOT_IMG_SHA256)"
+                exit 1
+              fi
+              stock=/tmp/stock-boot.img
+            else
+              echo "::warning::could not download the default stock boot.img - skipping boot.img repack."
+              echo "Flash the AnyKernel3 zip instead, or re-run with boot_img_url set."
+              exit 0
+            fi
+          fi
+
+          magic="$(head -c 8 "$stock" | tr -d '\0')"
+          [ "$magic" = "ANDROID!" ] || {
+            echo "::error::$stock is not an Android boot image (magic: '$magic')"
+            exit 1
+          }
+
+          py="$PWD/prebuilts/build-tools/path/linux-x86/python3"
+          [ -x "$py" ] || py="$(command -v python3)"
+          work=/tmp/bootrepack
+          rm -rf "$work"; mkdir -p "$work/unpacked"
+
+          "$py" "$PWD/tools/mkbootimg/unpack_bootimg.py" \
+            --boot_img "$stock" --out "$work/unpacked" \
+            --format=mkbootimg -0 > "$work/args0"
+
+          echo "::group::stock boot.img layout"
+          "$py" "$PWD/tools/mkbootimg/unpack_bootimg.py" --boot_img "$stock" --format=info || true
+          echo "::endgroup::"
+
+          mapfile -d '' MKBOOTIMG_ARGS < "$work/args0"
+          printf 'unpack_bootimg emitted %d argument(s):\n' "${#MKBOOTIMG_ARGS[@]}"
+          printf '  [%s]\n' "${MKBOOTIMG_ARGS[@]}"
+
+          if [ -f "$ART/Image.gz" ]; then
+            payload="$ART/Image.gz"
+          else
+            payload="$ART/Image"
+          fi
+          cp -f "$payload" "$work/kernel-payload"
+          echo "kernel payload: ${payload##*/} ($(stat -c %s "$work/kernel-payload") bytes)"
+
+          replaced=0
+          for i in "${!MKBOOTIMG_ARGS[@]}"; do
+            if [ "${MKBOOTIMG_ARGS[$i]}" = "--kernel" ]; then
+              MKBOOTIMG_ARGS[$((i + 1))]="$work/kernel-payload"
+              replaced=1
+              break
+            fi
+          done
+          [ "$replaced" -eq 1 ] || {
+            echo "::error::unpack_bootimg emitted no --kernel argument"
+            exit 1
+          }
+
+          "$py" "$PWD/tools/mkbootimg/mkbootimg.py" \
+            "${MKBOOTIMG_ARGS[@]}" --output "$work/boot-new.img"
+
+          avb="$PWD/prebuilts/kernel-build-tools/linux-x86/bin/avbtool"
+          if [ -x "$avb" ] && "$avb" info_image --image "$stock" >/dev/null 2>&1; then
+            psize=$(stat -c %s "$stock")
+            maxsize=$("$avb" add_hash_footer --partition_name boot \
+                        --partition_size "$psize" --calc_max_image_size)
+            newsize=$(stat -c %s "$work/boot-new.img")
+            echo "repacked $newsize B; max payload $maxsize B; partition $psize B"
+            if [ "$newsize" -gt "$maxsize" ]; then
+              echo "::error::repacked boot.img ($newsize B) does not fit the boot partition (max payload $maxsize B of $psize B)"
+              exit 1
+            fi
+            "$avb" add_hash_footer --image "$work/boot-new.img" \
+              --partition_name boot --partition_size "$psize"
+            echo "AVB hash footer added (partition_size=$psize, unsigned)"
+          else
+            echo "Stock image has no AVB footer (or avbtool unavailable) - leaving as is."
+          fi
+
+          cp -f "$work/boot-new.img" "$ART/boot.img"
+          ls -lh "$ART/boot.img"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: algiz-kernel-${{ github.run_number }}-${{ matrix.variant }}
+          if-no-files-found: error
+          retention-days: 30
+          path: |
+            ${{ env.WS }}/artifacts/*.zip
+            ${{ env.WS }}/artifacts/variant.json
+            ${{ env.WS }}/artifacts/boot.img
+            ${{ env.WS }}/artifacts/Image
+            ${{ env.WS }}/artifacts/Image.lz4
+            ${{ env.WS }}/artifacts/Image.gz
+            ${{ env.WS }}/artifacts/System.map
+            ${{ env.WS }}/artifacts/build.config.resolved
+            ${{ env.WS }}/artifacts/modules.builtin*
+
+      - name: Upload vmlinux and modules separately
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: algiz-debug-${{ github.run_number }}-${{ matrix.variant }}
+          if-no-files-found: ignore
+          retention-days: 7
+          path: |
+            ${{ env.WS }}/artifacts/vmlinux.zst
+            ${{ env.WS }}/artifacts/vmlinux.symvers
+            ${{ env.WS }}/artifacts/modules/**
+
+      - name: Summary
+        if: always()
+        working-directory: ${{ env.WS }}
+        env:
+          MODE: ${{ inputs.mode || 'user' }}
+          BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
+        run: |
+          set -uo pipefail
+          {
+            echo "## algiz kernel - \`${VARIANT}\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Variant | \`${VARIANT}\` - ${VARIANT_LABEL} |"
+            echo "| Kernel | \`${KVER:-unknown}\` |"
+            echo "| MTK mode | \`${MODE}\` |"
+            echo "| Scope | \`${BUILD_SCOPE}\` |"
+            echo "| AK3 zip | \`${ZIPNAME:-not built}\` |"
+            if [ -f artifacts/boot.img ]; then
+              echo "| boot.img | repacked from your stock image |"
+            else
+              echo "| boot.img | not built (no stock boot.img supplied) |"
+            fi
+            echo
+            echo "The release is cut once, by the \`release\` job, after all"
+            echo "variants finish."
+            echo
+            echo "### Artifacts"
+            echo '```'
+            ls -lh artifacts 2>/dev/null || echo "(none)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Disk usage (diagnostics)
+        if: always()
+        run: df -h / /mnt || true
+
+  # Advisory: exported-symbol CRCs must match the `stock` build, otherwise the
+  # variant's kABI drifted and stock vendor_dlkm modules may be rejected.
+  # Never blocks the release; it only annotates the run.
+  kabi:
+    needs: build
+    if: "!cancelled()"
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download debug artifacts (vmlinux.symvers)
+        uses: actions/download-artifact@v4
+        with:
+          pattern: algiz-debug-${{ github.run_number }}-*
+          path: dbg
+        continue-on-error: true
+
+      - name: Compare symbol CRCs against stock
+        run: |
+          set +e   # advisory job: diff/awk exit codes must never fail the step
+          set -u
+          pre="dbg/algiz-debug-${{ github.run_number }}"
+          base="$pre-stock/vmlinux.symvers"
+          if [ ! -f "$base" ]; then
+            echo "No stock baseline in this run (build the 'stock' variant too) - skipping."
+            exit 0
+          fi
+          norm() { awk '{print $1, $2}' "$1" | sort -k2; }
+          norm "$base" > /tmp/base.txt
+          {
+            echo "## kABI check vs stock"
+            echo
+            echo "Only **changed CRC** or **removed** symbols can break stock vendor modules."
+            echo "**Added** exports (e.g. from IP_SET / USER_NS built in) are harmless."
+            echo
+            echo "| Variant | Changed CRC | Removed | Added (harmless) |"
+            echo "|---|---|---|---|"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for d in "$pre"-*; do
+            v="${d#"$pre"-}"
+            [ "$v" = "stock" ] && continue
+            [ -f "$d/vmlinux.symvers" ] || continue
+            norm "$d/vmlinux.symvers" > /tmp/var.txt
+            changed="$(awk 'NR==FNR{b[$2]=$1;next} ($2 in b)&&(b[$2]!=$1){print $2}' /tmp/base.txt /tmp/var.txt)"
+            removed="$(awk 'NR==FNR{v[$2]=1;next} !($2 in v){print $2}' /tmp/var.txt /tmp/base.txt)"
+            added="$(awk 'NR==FNR{b[$2]=1;next} !($2 in b){print $2}' /tmp/base.txt /tmp/var.txt)"
+            nc="$(printf '%s' "$changed" | grep -c .)"
+            nr="$(printf '%s' "$removed" | grep -c .)"
+            na="$(printf '%s' "$added" | grep -c .)"
+            echo "| \`$v\` | $nc | $nr | $na |" >> "$GITHUB_STEP_SUMMARY"
+            if [ "$nc" -gt 0 ] || [ "$nr" -gt 0 ]; then
+              echo "::warning::$v: kABI drift vs stock - $nc changed CRC, $nr removed"
+              printf 'changed: %s\n' $changed | head -20
+              printf 'removed: %s\n' $removed | head -20
+            else
+              echo "$v: kABI OK - no changed/removed symbols ($na added exports)"
+            fi
+          done
+          exit 0
+
+  release:
+    needs: [plan, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    # Auto-release on push to main and on manual workflow_dispatch (unless publish_release is explicitly unchecked).
+    if: "!cancelled() && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release != false))"
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+        with:
+          path: recipe
+
+      - name: Download every variant's artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: algiz-kernel-${{ github.run_number }}-*
+          path: dl
+
+      - name: Publish one release with all variants
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          MODE: ${{ inputs.mode || 'user' }}
+          BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
+          WANTED: ${{ needs.plan.outputs.count }}
+        run: |
+          set -euo pipefail
+          stage=/tmp/release
+          meta=/tmp/meta
+          rm -rf "$stage" "$meta"; mkdir -p "$stage" "$meta"
+
+          shopt -s nullglob
+          variants=()
+          for d in dl/algiz-kernel-*; do
+            [ -f "$d/variant.json" ] || { echo "::warning::$d has no variant.json - skipped"; continue; }
+            v="$(jq -r .variant "$d/variant.json")"
+            echo "::group::$v"
+            cp -f "$d/variant.json" "$meta/$v.json"
+            for f in "$d"/*; do
+              b="${f##*/}"
+              case "$b" in
+                variant.json) continue ;;
+                *.zip)        cp -f "$f" "$stage/$b" ;;
+                *)            cp -f "$f" "$stage/${v}-${b}" ;;
+              esac
+              echo "  $b"
+            done
+            echo "::endgroup::"
+            variants+=("$v")
+          done
+
+          [ "${#variants[@]}" -gt 0 ] || {
+            echo "::error::no variant produced artifacts - nothing to release"
+            exit 1
+          }
+          echo "staged ${#variants[@]} of ${WANTED} requested variant(s): ${variants[*]}"
+          if [ "${#variants[@]}" -lt "$WANTED" ]; then
+            echo "::warning::only ${#variants[@]} of ${WANTED} variants built; releasing what exists"
+          fi
+
+          kver="$(jq -r .kver "$meta/${variants[0]}.json")"
+          for v in "${variants[@]}"; do
+            k="$(jq -r .kver "$meta/$v.json")"
+            [ "$k" = "$kver" ] || {
+              echo "::error::variant $v built kernel $k, expected $kver"
+              exit 1
+            }
+          done
+          tag="v${kver}-${GITHUB_RUN_NUMBER}"
+
+          cd "$stage"
+          mapfile -t assets < <(ls -1)
+          sha256sum -- "${assets[@]}" > SHA256SUMS
+          assets+=(SHA256SUMS)
+          cat SHA256SUMS
+          echo "attaching ${#assets[@]} assets"
+
+          jq -s '.' "$meta"/*.json > /tmp/variants.json
+          N="$(jq -r 'length' /tmp/variants.json)"
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+          # Generate release notes inline for all 8 variants (no external script edit needed)
+          {
+            echo "## Volla Phone Quintus (\`algiz\`) — Linux \`${kver}\` (${N} variant(s))"
+            echo
+            echo "Built from HelloVolla's MT6877 (\`kernel-6.6\`) tree with Kleaf/Bazel (\`mode=${MODE}\`, \`scope=${BUILD_SCOPE}\`) in workflow run [#${GITHUB_RUN_NUMBER}](${RUN_URL})."
+            echo
+            echo "### Variants Included in This Release"
+            echo
+            echo "| Variant | DroidSpaces | USB-Arsenal | SELinux | AnyKernel3 Flashable Zip | Pre-packed Boot Image |"
+            echo "| :--- | :---: | :---: | :---: | :--- | :--- |"
+
+            ORDERED_VARIANTS=(
+              "stock"
+              "stock-permissive"
+              "droidspaces-enforcing"
+              "droidspaces-permissive"
+              "usbarsenal-enforcing"
+              "usbarsenal-permissive"
+              "droidspaces-usbarsenal-enforcing"
+              "droidspaces-usbarsenal-permissive"
+            )
+            for v in "${ORDERED_VARIANTS[@]}"; do
+              row="$(jq -c --arg v "$v" 'map(select(.variant == $v)) | if length > 0 then .[0] else empty end' /tmp/variants.json)"
+              [ -n "$row" ] || continue
+              zipname="$(jq -r '.zipname' <<<"$row")"
+              ds="$(jq -r 'if .droidspaces then "Yes" else "No" end' <<<"$row")"
+              ua="$(jq -r 'if .usbarsenal then "Yes" else "No" end' <<<"$row")"
+              sel="$(jq -r 'if .permissive then "Permissive" else "Enforcing" end' <<<"$row")"
+              printf '| `%s` | %s | %s | %s | `%s` | `%s-boot.img` |\n' \
+                "$v" "$ds" "$ua" "$sel" "$zipname" "$v"
+            done
+
+            echo
+            echo "### What Each Feature Set Includes"
+            echo
+            echo "* **DroidSpaces** ([ravindu644/Droidspaces-OSS](https://github.com/ravindu644/Droidspaces-OSS)): Applies the GKI kABI-preserving SYSVIPC padding patch (\`ANDROID_KABI_USE(6, ...)\` / \`_ANDROID_KABI_REPLACE(7, 8)\`) and enables GKI-safe container namespaces, POSIX mqueues, IPv6 NAT (\`NAT66\`), UFW/Fail2ban netfilter targets, and tmpfs POSIX ACL/xattr support without breaking stock \`vendor_dlkm\` modules."
+            echo "* **USB-Arsenal** ([ravindu644/USB-Arsenal](https://github.com/ravindu644/USB-Arsenal)): Applies the 6.6 \`android_configfs_uevent\` unregister fix and PiKVM CD/DVD mass-storage emulation (\`cd_as_dvd\`) patch, and enables full USB Gadget ConfigFS functions (\`HID\`, \`Mass Storage\`, \`RNDIS\`, \`ECM\`, \`NCM\`, \`ACM\`, \`Serial\`, \`EEM\`, \`OBEX\`, \`FunctionFS\`, \`Audio/MIDI\`, \`UVC\`)."
+            echo "* **DroidSpaces extras** (DroidSpaces variants, on by default): \`CONFIG_MACVLAN\` (\`--net=macvlan\`), \`CONFIG_CFS_BANDWIDTH\` (CPU limit) and \`CONFIG_CGROUP_PIDS\` (process limit). \`CGROUP_PIDS\` grows the cgroup subsystem table, so check the run's *kABI check vs stock* summary; if it reports drift, rebuild with \`droidspaces_extras\` off."
+            echo "* **USB-Arsenal HID poll interval**: the \`f_hid\` configurable-interval patch (\`usb-arsenal hid --interval\`) is applied when it fits the 6.6 tree; the run log says whether it landed."
+            echo "* **SELinux Permissive**: Patches \`enforcing_enabled()\` in \`security/selinux/include/security.h\` to return \`false\` while keeping \`selinuxfs\` mounted and policy loaded."
+            echo
+            echo "### Flashing & Root Notes"
+            echo
+            echo "Step-by-step flashing (recovery zip or fastboot \`boot.img\`) and how to build both yourself: [docs/make-img-and-flash-zip.md](https://github.com/${GITHUB_REPOSITORY}/blob/main/docs/make-img-and-flash-zip.md)."
+            echo
+            echo "* **AnyKernel3 Zip**: Flash \`AK3-algiz-<variant>-*.zip\` in recovery or a kernel manager app."
+            echo "* **Raw Images**: Each variant also attaches \`<variant>-Image\`, \`<variant>-Image.gz\`, \`<variant>-Image.lz4\`, and \`<variant>-build.config.resolved\`."
+            echo "* **Root**: No root solution is compiled into the kernel image by design. Use **KernelSU (LKM mode)** by patching your \`init_boot.img\`." 
+          } > /tmp/notes.md
+
+          gh release create "$tag" \
+            --title "algiz kernel ${kver} - ${#variants[@]} variants (build ${GITHUB_RUN_NUMBER})" \
+            --notes-file /tmp/notes.md \
+            --target "$GITHUB_SHA" \
+            "${assets[@]}"
+
+          url="$(gh release view "$tag" --json url --jq .url)"
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "RELEASE_URL=$url" >> "$GITHUB_ENV"
+          echo "VARIANTS=${variants[*]}" >> "$GITHUB_ENV"
+          echo "published $url"
+
+      - name: Verify every asset actually uploaded
+        run: |
+          set -euo pipefail
+          bad="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+                   --jq '.assets[] | select(.state != "uploaded") | .name')"
+          [ -z "$bad" ] || { echo "::error::assets not fully uploaded: $bad"; exit 1; }
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            --jq '.assets[] | "  \(.state)  \(.size)  \(.name)"'
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Summary
+        if: always()
+        run: |
+          set -uo pipefail
+          {
+            echo "## algiz kernels - one release, all variants"
+            echo
+            if [ -n "${RELEASE_URL:-}" ]; then
+              echo "Released [\`${RELEASE_TAG}\`](${RELEASE_URL}) with variants: \`${VARIANTS:-}\`"
+            else
+              echo "No release was published."
+            fi
+            echo
+            echo "| Variant | DroidSpaces | USB-Arsenal | SELinux | Pick it when |"
+            echo "|---|---|---|---|---|"
+            echo "| \`stock\` | No | No | Enforcing | Pure stock kernel and security. |"
+            echo "| \`stock-permissive\` | No | No | Permissive | Stock config with SELinux permissive. |"
+            echo "| \`droidspaces-enforcing\` | Yes | No | Enforcing | DroidSpaces containers with stock SELinux enforcing. |"
+            echo "| \`droidspaces-permissive\` | Yes | No | Permissive | DroidSpaces containers with SELinux permissive. |"
+            echo "| \`usbarsenal-enforcing\` | No | Yes | Enforcing | USB-Arsenal gadget emulation with SELinux enforcing. |"
+            echo "| \`usbarsenal-permissive\` | No | Yes | Permissive | USB-Arsenal gadget emulation with SELinux permissive. |"
+            echo "| \`droidspaces-usbarsenal-enforcing\` | Yes | Yes | Enforcing | Full DroidSpaces + USB-Arsenal with SELinux enforcing. |"
+            echo "| \`droidspaces-usbarsenal-permissive\` | Yes | Yes | Permissive | Full DroidSpaces + USB-Arsenal with SELinux permissive. |"
+            echo
+            echo "Root is **not** compiled into any variant. Patch \`init_boot.img\` with"
+            echo "KernelSU (LKM mode) - see the release notes."
+          } >> "$GITHUB_STEP_SUMMARY"

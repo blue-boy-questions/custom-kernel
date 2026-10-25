@@ -1,0 +1,52 @@
+Make SELinux permanently permissive
+
+enforcing_enabled() is the single predicate every SELinux enforcement
+decision passes through. In Linux 6.6 there are exactly five readers:
+
+  security/selinux/avc.c:1014        avc_denied()
+  security/selinux/hooks.c:5950      unrecognized-netlink fallback
+  security/selinux/ss/services.c:744  security_validate_transition()
+  security/selinux/ss/services.c:1665 compute_sid_handle_invalid_context()
+  security/selinux/ss/services.c:1972 convert_context_handle_invalid_context()
+
+plus security/selinux/selinuxfs.c, which only reports the value. Returning
+false here therefore makes the whole LSM log-and-allow without touching a
+single hook, a single struct, or a single exported symbol - so it is kABI
+neutral by construction.
+
+This deliberately does NOT touch enforcing_set(), so selinux_state.enforcing
+is still written and /sys/fs/selinux/enforce stays writable: setenforce(8)
+keeps returning success, it simply has no effect.
+
+This is not selinux=0. selinuxfs is still registered and the policy is still
+loaded, which is what Android init requires in order to boot at all.
+
+--- a/security/selinux/include/security.h
++++ b/security/selinux/include/security.h
+@@ -124,7 +124,25 @@
+ #ifdef CONFIG_SECURITY_SELINUX_DEVELOP
+ static inline bool enforcing_enabled(void)
+ {
+-	return READ_ONCE(selinux_state.enforcing);
++	/*
++	 * Permanently permissive build.
++	 *
++	 * Every enforcement decision in SELinux funnels through this one
++	 * predicate - avc_denied(), the netlink-message fallback in hooks.c,
++	 * security_validate_transition(), compute_sid_handle_invalid_context()
++	 * and convert_context_handle_invalid_context() are the only readers -
++	 * so returning false here makes the whole LSM log-and-allow without
++	 * touching a single hook.
++	 *
++	 * selinux_state.enforcing is deliberately still written by
++	 * enforcing_set(), so /sys/fs/selinux/enforce stays writable and
++	 * userspace setenforce(8) keeps returning success. It just has no
++	 * effect: getenforce reports Permissive again on the next read.
++	 *
++	 * selinuxfs is still mounted and the policy is still loaded, which is
++	 * what Android init requires to boot. This is NOT selinux=0.
++	 */
++	return false;
+ }
+
+ static inline void enforcing_set(bool value)
