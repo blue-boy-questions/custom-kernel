@@ -20,6 +20,14 @@
 # "Permissive" is NOT selinux=0: selinuxfs stays mounted and the policy is
 # still loaded (Android init requires both), but nothing is ever denied.
 #
+# Extras test run: pick variants = bisect-droidspaces-usbarsenal-enforcing to
+# build three DroidSpaces + USB-Arsenal test kernels in one run and publish
+# them as a PRE-RELEASE with its own tag (v<kernel>-extras-test-<run>):
+#   t1 = MACVLAN only
+#   t2 = MACVLAN + CGROUP_PIDS (process limit)
+#   t3 = MACVLAN + CFS_BANDWIDTH (CPU limit)
+# Flash t1, t2, t3 in that order; the first one that bootloops names the option.
+#
 # Auto-release is enabled on both push to `main` and manual workflow_dispatch.
 # ------------------------------------------------------------------
 name: Build algiz kernels
@@ -41,6 +49,7 @@ on:
           - usbarsenal-permissive
           - droidspaces-usbarsenal-enforcing
           - droidspaces-usbarsenal-permissive
+          - bisect-droidspaces-usbarsenal-enforcing
       build_scope:
         description: "image = GKI Image only (default, kABI-safe). dist = full MediaTek dist build (all vendor modules, ~3-5h)"
         type: choice
@@ -59,12 +68,24 @@ on:
         description: "Direct download URL of your STOCK boot.img. Empty = use the stock-images-algiz release asset (sha256-checked). A committed boot/boot.img always wins. A flashable boot.img is repacked per variant."
         type: string
         default: ""
-      droidspaces_extras:
-        description: "DroidSpaces variants only: also enable MACVLAN, CFS_BANDWIDTH (CPU limit) and CGROUP_PIDS (process limit). Turn off if the kABI job reports drift or the phone bootloops."
+      ds_macvlan:
+        description: "DroidSpaces variants only (ignored by bisect-*, which builds fixed test combinations): enable CONFIG_MACVLAN (--net=macvlan). Low risk: only touches private net structs."
         type: boolean
         default: true
+      ds_cpu_limit:
+        description: "DroidSpaces variants only: enable CGROUP_SCHED + FAIR_GROUP_SCHED + CFS_BANDWIDTH (CPU limit, cpu.max). Changes scheduler structs: OFF by default, test on its own."
+        type: boolean
+        default: false
+      ds_pids_limit:
+        description: "DroidSpaces variants only: enable CGROUP_PIDS (process limit, pids.max). Grows the cgroup subsystem table: OFF by default, test on its own."
+        type: boolean
+        default: false
       disable_sandbox:
         description: "Add --config=local (disables the Bazel sandbox). Only needed if you hit sandbox errors."
+        type: boolean
+        default: false
+      prerelease:
+        description: "Mark the GitHub release as a pre-release. Always on for the bisect-* variants option."
         type: boolean
         default: false
       publish_release:
@@ -112,11 +133,16 @@ jobs:
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
       count: ${{ steps.pick.outputs.count }}
+      bisect: ${{ steps.pick.outputs.bisect }}
     steps:
       - name: Decide which variants to build
         id: pick
         env:
           WANT: ${{ inputs.variants || 'all' }}
+          # Push-triggered builds only get the low-risk extra (MACVLAN).
+          X_MACVLAN: ${{ github.event_name != 'workflow_dispatch' || inputs.ds_macvlan }}
+          X_CPU: ${{ github.event_name == 'workflow_dispatch' && inputs.ds_cpu_limit }}
+          X_PIDS: ${{ github.event_name == 'workflow_dispatch' && inputs.ds_pids_limit }}
         run: |
           set -euo pipefail
           cat > /tmp/all.json <<'JSON'
@@ -139,11 +165,28 @@ jobs:
              "label":"DroidSpaces + USB-Arsenal, SELinux permissive"}
           ]
           JSON
+          bisect=false
           if [ "$WANT" = "all" ]; then
-            sel=$(jq -c '.' /tmp/all.json)
+            sel=$(jq -c --arg m "$X_MACVLAN" --arg c "$X_CPU" --arg p "$X_PIDS" \
+                  'map(. + {xmacvlan:$m, xcpu:$c, xpids:$p})' /tmp/all.json)
+          elif [ "${WANT#bisect-}" != "$WANT" ]; then
+            bisect=true
+            base="${WANT#bisect-}"
+            entry=$(jq -c --arg v "$base" '.[] | select(.variant == $v and .droidspaces == true)' /tmp/all.json)
+            [ -n "$entry" ] || { echo "::error::bisect needs a DroidSpaces variant, got '$base'"; exit 1; }
+            sel=$(jq -c '[
+              (. + {variant:(.variant+"-t1"), label:(.label+" - test t1: MACVLAN only"),
+                    xmacvlan:"true", xcpu:"false", xpids:"false"}),
+              (. + {variant:(.variant+"-t2"), label:(.label+" - test t2: MACVLAN + process limit (CGROUP_PIDS)"),
+                    xmacvlan:"true", xcpu:"false", xpids:"true"}),
+              (. + {variant:(.variant+"-t3"), label:(.label+" - test t3: MACVLAN + CPU limit (CFS_BANDWIDTH)"),
+                    xmacvlan:"true", xcpu:"true", xpids:"false"})
+            ]' <<<"$entry")
           else
-            sel=$(jq -c --arg v "$WANT" '[.[] | select(.variant == $v)]' /tmp/all.json)
+            sel=$(jq -c --arg v "$WANT" --arg m "$X_MACVLAN" --arg c "$X_CPU" --arg p "$X_PIDS" \
+                  '[.[] | select(.variant == $v) | . + {xmacvlan:$m, xcpu:$c, xpids:$p}]' /tmp/all.json)
           fi
+          echo "bisect=$bisect" >> "$GITHUB_OUTPUT"
           n=$(jq 'length' <<<"$sel")
           [ "$n" -gt 0 ] || { echo "::error::no variant matches '$WANT'"; exit 1; }
           echo "matrix={\"include\":$sel}" >> "$GITHUB_OUTPUT"
@@ -398,7 +441,11 @@ jobs:
         env:
           ENABLE_DROIDSPACES: ${{ matrix.droidspaces }}
           ENABLE_USBARSENAL: ${{ matrix.usbarsenal }}
-          ENABLE_EXTRAS: ${{ github.event_name != 'workflow_dispatch' || inputs.droidspaces_extras }}
+          # Push-triggered builds only get the low-risk extra (MACVLAN).
+          # Decided per matrix entry by the plan job (bisect runs differ per entry).
+          ENABLE_MACVLAN: ${{ matrix.xmacvlan }}
+          ENABLE_CPU_LIMIT: ${{ matrix.xcpu }}
+          ENABLE_PIDS_LIMIT: ${{ matrix.xpids }}
         run: |
           set -euo pipefail
           DEFCONFIG="$KERNEL_DIR/arch/arm64/configs/gki_defconfig"
@@ -437,15 +484,19 @@ jobs:
           # CGROUP_SUBSYS_COUNT (and so struct cgroup / css_set arrays) and shifts
           # the IDs of rdma/misc/debug if they are enabled. The advisory `kabi`
           # job shows whether any exported CRC changed; if it does, re-run with
-          # the droidspaces_extras input off.
-          DS_EXTRA_SYMBOLS=(
-            MACVLAN
-            CGROUP_SCHED
-            FAIR_GROUP_SCHED
-            CFS_BANDWIDTH
-            CGROUP_PIDS
-          )
-          echo "$ENABLE_EXTRAS" > "$WS/ds-extras.txt"
+          # the matching ds_* input off. Each extra is a separate input so a
+          # bootloop can be bisected (ds_macvlan / ds_cpu_limit / ds_pids_limit).
+          DS_EXTRA_SYMBOLS=()
+          if [ "$ENABLE_MACVLAN" = "true" ]; then
+            DS_EXTRA_SYMBOLS+=(MACVLAN)
+          fi
+          if [ "$ENABLE_CPU_LIMIT" = "true" ]; then
+            DS_EXTRA_SYMBOLS+=(CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH)
+          fi
+          if [ "$ENABLE_PIDS_LIMIT" = "true" ]; then
+            DS_EXTRA_SYMBOLS+=(CGROUP_PIDS)
+          fi
+          printf '%s\n' "${DS_EXTRA_SYMBOLS[@]:-}" | sed '/^$/d' > "$WS/ds-extras.txt"
 
           UA_SYMBOL_CANDIDATES=(
             "USB_GADGET"
@@ -540,8 +591,8 @@ jobs:
             done
           fi
 
-          if [ "$ENABLE_DROIDSPACES" = "true" ] && [ "$ENABLE_EXTRAS" = "true" ]; then
-            apply_symbol_group "DroidSpaces extras (macvlan, CPU limit, process limit)" "${DS_EXTRA_SYMBOLS[@]}"
+          if [ "$ENABLE_DROIDSPACES" = "true" ] && [ "${#DS_EXTRA_SYMBOLS[@]}" -gt 0 ]; then
+            apply_symbol_group "DroidSpaces extras (${DS_EXTRA_SYMBOLS[*]})" "${DS_EXTRA_SYMBOLS[@]}"
             for sym in "${DS_EXTRA_SYMBOLS[@]}"; do
               grep -qx -- "CONFIG_${sym}=y" "$DEFCONFIG" || { echo "  FAIL CONFIG_${sym}"; bad=1; }
             done
@@ -835,9 +886,9 @@ jobs:
             done
           fi
 
-          if [ "$DROIDSPACES" = "true" ] && [ "$(cat "$WS/ds-extras.txt" 2>/dev/null)" = "true" ]; then
-            echo "== DroidSpaces extras (macvlan / CPU limit / process limit) =="
-            for s in MACVLAN CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH CGROUP_PIDS; do
+          if [ "$DROIDSPACES" = "true" ] && [ -s "$WS/ds-extras.txt" ]; then
+            echo "== DroidSpaces extras requested for this run: $(tr '\n' ' ' < "$WS/ds-extras.txt") =="
+            for s in $(cat "$WS/ds-extras.txt"); do
               v="$(sed -n "s/^CONFIG_${s}=//p" "$cfg" | head -1)"
               case "$v" in
                 y|m) printf '  ok    CONFIG_%s=%s\n' "$s" "$v" ;;
@@ -973,7 +1024,15 @@ jobs:
           sver="$(sed -n 's/^CONFIG_LOCALVERSION="\(.*\)"$/\1/p' \
                    "$KERNEL_DIR/arch/arm64/configs/gki_defconfig" | head -1)"
           kver="$(sed -n 's/^VERSION = //p' "$KERNEL_DIR/Makefile" | head -1).$(sed -n 's/^PATCHLEVEL = //p' "$KERNEL_DIR/Makefile" | head -1).$(sed -n 's/^SUBLEVEL = //p' "$KERNEL_DIR/Makefile" | head -1)"
-          zipname="AK3-algiz-${VARIANT}-${kver}${sver}-${MODE}-$(date -u +%Y%m%d).zip"
+          # Tag the zip with the DroidSpaces extras it contains, so builds with
+          # different extras can be told apart (and bisected) by file name.
+          xtag=""
+          if [ "$DROIDSPACES" = "true" ] && [ -s "$WS/ds-extras.txt" ]; then
+            grep -qx MACVLAN "$WS/ds-extras.txt"        && xtag="${xtag}-macvlan"
+            grep -qx CFS_BANDWIDTH "$WS/ds-extras.txt"  && xtag="${xtag}-cpu"
+            grep -qx CGROUP_PIDS "$WS/ds-extras.txt"    && xtag="${xtag}-pids"
+          fi
+          zipname="AK3-algiz-${VARIANT}${xtag}-${kver}${sver}-${MODE}-$(date -u +%Y%m%d_%H%M).zip"
 
           ( cd "$ak" && zip -r9 "$ART/$zipname" . -x '.git*' >/dev/null )
           echo "ZIPNAME=$zipname" >> "$GITHUB_ENV"
@@ -1246,6 +1305,8 @@ jobs:
           MODE: ${{ inputs.mode || 'user' }}
           BUILD_SCOPE: ${{ inputs.build_scope || 'image' }}
           WANTED: ${{ needs.plan.outputs.count }}
+          BISECT: ${{ needs.plan.outputs.bisect }}
+          PRERELEASE_IN: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
           stage=/tmp/release
@@ -1289,7 +1350,13 @@ jobs:
               exit 1
             }
           done
-          tag="v${kver}-${GITHUB_RUN_NUMBER}"
+          prerelease=false
+          if [ "$BISECT" = "true" ] || [ "$PRERELEASE_IN" = "true" ]; then prerelease=true; fi
+          if [ "$BISECT" = "true" ]; then
+            tag="v${kver}-extras-test-${GITHUB_RUN_NUMBER}"
+          else
+            tag="v${kver}-${GITHUB_RUN_NUMBER}"
+          fi
 
           cd "$stage"
           mapfile -t assets < <(ls -1)
@@ -1323,6 +1390,10 @@ jobs:
               "droidspaces-usbarsenal-enforcing"
               "droidspaces-usbarsenal-permissive"
             )
+            # Variants outside the standard eight (the bisect t1/t2/t3 tests) go last.
+            for v in "${variants[@]}"; do
+              case " ${ORDERED_VARIANTS[*]} " in *" $v "*) ;; *) ORDERED_VARIANTS+=("$v") ;; esac
+            done
             for v in "${ORDERED_VARIANTS[@]}"; do
               row="$(jq -c --arg v "$v" 'map(select(.variant == $v)) | if length > 0 then .[0] else empty end' /tmp/variants.json)"
               [ -n "$row" ] || continue
@@ -1334,12 +1405,26 @@ jobs:
                 "$v" "$ds" "$ua" "$sel" "$zipname" "$v"
             done
 
+            if [ "$BISECT" = "true" ]; then
+              echo
+              echo "### Extras test builds (pre-release)"
+              echo
+              echo "Same kernel, differing only in the DroidSpaces extras. Flash them **in order** and stop at the first one that bootloops: that tells you which option the phone rejects."
+              echo
+              echo "| Test | MACVLAN | CGROUP_PIDS (process limit) | CFS_BANDWIDTH (CPU limit) |"
+              echo "| :--- | :---: | :---: | :---: |"
+              echo "| \`-t1\` | Yes | No | No |"
+              echo "| \`-t2\` | Yes | Yes | No |"
+              echo "| \`-t3\` | Yes | No | Yes |"
+              echo
+              echo "Restore with your stock \`boot.img\` (\`fastboot flash boot stock-boot.img\`). Report which test loops and which passed."
+            fi
             echo
             echo "### What Each Feature Set Includes"
             echo
             echo "* **DroidSpaces** ([ravindu644/Droidspaces-OSS](https://github.com/ravindu644/Droidspaces-OSS)): Applies the GKI kABI-preserving SYSVIPC padding patch (\`ANDROID_KABI_USE(6, ...)\` / \`_ANDROID_KABI_REPLACE(7, 8)\`) and enables GKI-safe container namespaces, POSIX mqueues, IPv6 NAT (\`NAT66\`), UFW/Fail2ban netfilter targets, and tmpfs POSIX ACL/xattr support without breaking stock \`vendor_dlkm\` modules."
             echo "* **USB-Arsenal** ([ravindu644/USB-Arsenal](https://github.com/ravindu644/USB-Arsenal)): Applies the 6.6 \`android_configfs_uevent\` unregister fix and PiKVM CD/DVD mass-storage emulation (\`cd_as_dvd\`) patch, and enables full USB Gadget ConfigFS functions (\`HID\`, \`Mass Storage\`, \`RNDIS\`, \`ECM\`, \`NCM\`, \`ACM\`, \`Serial\`, \`EEM\`, \`OBEX\`, \`FunctionFS\`, \`Audio/MIDI\`, \`UVC\`)."
-            echo "* **DroidSpaces extras** (DroidSpaces variants, on by default): \`CONFIG_MACVLAN\` (\`--net=macvlan\`), \`CONFIG_CFS_BANDWIDTH\` (CPU limit) and \`CONFIG_CGROUP_PIDS\` (process limit). \`CGROUP_PIDS\` grows the cgroup subsystem table, so check the run's *kABI check vs stock* summary; if it reports drift, rebuild with \`droidspaces_extras\` off."
+            echo "* **DroidSpaces extras** (DroidSpaces variants): separate toggles \`ds_macvlan\` (\`CONFIG_MACVLAN\`, on by default), \`ds_cpu_limit\` (\`CFS_BANDWIDTH\`, off by default) and \`ds_pids_limit\` (\`CGROUP_PIDS\`, off by default). The zip name carries \`-macvlan\`, \`-cpu\` and/or \`-pids\` for the extras it contains. \`CGROUP_PIDS\` grows the cgroup subsystem table and \`CFS_BANDWIDTH\` changes scheduler structs, so check the run's *kABI check vs stock* summary."
             echo "* **USB-Arsenal HID poll interval**: the \`f_hid\` configurable-interval patch (\`usb-arsenal hid --interval\`) is applied when it fits the 6.6 tree; the run log says whether it landed."
             echo "* **SELinux Permissive**: Patches \`enforcing_enabled()\` in \`security/selinux/include/security.h\` to return \`false\` while keeping \`selinuxfs\` mounted and policy loaded."
             echo
@@ -1352,10 +1437,15 @@ jobs:
             echo "* **Root**: No root solution is compiled into the kernel image by design. Use **KernelSU (LKM mode)** by patching your \`init_boot.img\`." 
           } > /tmp/notes.md
 
+          title="algiz kernel ${kver} - ${#variants[@]} variants (build ${GITHUB_RUN_NUMBER})"
+          [ "$BISECT" = "true" ] && title="algiz kernel ${kver} - extras test t1/t2/t3 (build ${GITHUB_RUN_NUMBER})"
+          pre_flag=()
+          [ "$prerelease" = "true" ] && pre_flag=(--prerelease)
           gh release create "$tag" \
-            --title "algiz kernel ${kver} - ${#variants[@]} variants (build ${GITHUB_RUN_NUMBER})" \
+            --title "$title" \
             --notes-file /tmp/notes.md \
             --target "$GITHUB_SHA" \
+            "${pre_flag[@]}" \
             "${assets[@]}"
 
           url="$(gh release view "$tag" --json url --jq .url)"

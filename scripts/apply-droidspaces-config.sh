@@ -65,18 +65,19 @@ DS_SYMBOLS=(
 )
 
 # Optional DroidSpaces features (Requirements Check: "Macvlan support",
-# "CPU limit support", "Process limit support"). Applied unless DS_EXTRAS=0.
-# MACVLAN and CFS_BANDWIDTH only touch private structs; CGROUP_PIDS grows
-# CGROUP_SUBSYS_COUNT, so check the kABI diff against a stock build.
-if [ "${DS_EXTRAS:-1}" != "0" ]; then
-  DS_SYMBOLS+=(
-    MACVLAN
-    CGROUP_SCHED
-    FAIR_GROUP_SCHED
-    CFS_BANDWIDTH
-    CGROUP_PIDS
-  )
+# "CPU limit support", "Process limit support"). Each one is its own switch so
+# a bootloop can be bisected:
+#   DS_MACVLAN=1    (default on)   MACVLAN                       private net structs
+#   DS_CPU_LIMIT=0  (default off)  CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH
+#                                  changes scheduler structs
+#   DS_PIDS_LIMIT=0 (default off)  CGROUP_PIDS                   grows CGROUP_SUBSYS_COUNT
+# DS_EXTRAS=1 is kept as a shortcut that turns all three on.
+if [ "${DS_EXTRAS:-0}" = "1" ]; then
+  DS_MACVLAN=1; DS_CPU_LIMIT=1; DS_PIDS_LIMIT=1
 fi
+[ "${DS_MACVLAN:-1}" = "1" ]    && DS_SYMBOLS+=(MACVLAN)
+[ "${DS_CPU_LIMIT:-0}" = "1" ]  && DS_SYMBOLS+=(CGROUP_SCHED FAIR_GROUP_SCHED CFS_BANDWIDTH)
+[ "${DS_PIDS_LIMIT:-0}" = "1" ] && DS_SYMBOLS+=(CGROUP_PIDS)
 
 # Options DroidSpaces treats as fatal-if-missing. Not written by this script
 # unless they are also in DS_SYMBOLS; only verified afterwards.

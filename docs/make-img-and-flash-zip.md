@@ -25,9 +25,16 @@ release (sha256 `227e34c2798893a0743da64b4ed44413b9cfda6501087596af99b781625d272
    the `stock-images-algiz` release, checks its sha256, and repacks one
    `<variant>-boot.img` per variant. (Paste your own URL to use a different stock
    image, or commit `boot/boot.img`; a committed file wins over the URL.)
-4. Leave `droidspaces_extras` **on** to get macvlan, CPU limit and process limit
-   in the DroidSpaces variants. Turn it off if the *kABI check vs stock* summary
-   reports changed CRCs, or the phone bootloops.
+4. DroidSpaces extras are three separate checkboxes: `ds_macvlan` (on by
+   default, low risk), `ds_cpu_limit` (off) and `ds_pids_limit` (off). Add them
+   **one at a time**: flash, boot, then enable the next. The zip name shows what
+   it contains (`-macvlan`, `-cpu`, `-pids`). The first build that bootloops
+   tells you which option the phone does not accept.
+
+   Shortcut: choose `variants` = `bisect-droidspaces-usbarsenal-enforcing`.
+   One run builds `-t1` (MACVLAN), `-t2` (MACVLAN + process limit) and `-t3`
+   (MACVLAN + CPU limit) and publishes them as a pre-release tagged
+   `v<kernel>-extras-test-<run>`. Flash t1, t2, t3 in that order.
 5. When the run finishes, open the **Releases** page. Each variant has
    `AK3-algiz-<variant>-...zip` and `<variant>-boot.img`, plus `SHA256SUMS`.
    Download and verify:
@@ -174,7 +181,7 @@ getenforce                     # Enforcing, or Permissive on *-permissive varian
 ```
 
 - **DroidSpaces:** open the app -> *Requirements* -> *Check*. With
-  `droidspaces_extras` on you should now see `[✓]` for Macvlan, CPU limit and
+  the matching extra on you should now see `[✓]` for Macvlan, CPU limit and/or
   Process limit.
 - **USB-Arsenal:** `usb-arsenal check`. `HID poll interval (f_hid)` should be
   `[+]`. If it is still `[-]`, open the build log's
@@ -195,6 +202,11 @@ on screen).
 
 1. Hold power + volume down to reach fastboot, then
    `fastboot flash boot stock-boot.img`.
-2. Rebuild with `droidspaces_extras` **off** (the `CGROUP_PIDS` option is the
-   only one that can disturb the cgroup layout vendor modules were built
-   against) and compare the *kABI check vs stock* table between the two runs.
+2. Rebuild with `ds_cpu_limit` and `ds_pids_limit` **off** (`CGROUP_PIDS` grows
+   the cgroup layout and `CFS_BANDWIDTH` changes scheduler structs that vendor
+   modules were built against), then enable them one by one and compare the
+   *kABI check vs stock* table between runs.
+3. Also note that the workflow clones the *latest* AnyKernel3, so the bundled
+   `magiskboot`/`magiskpolicy` can differ between two builds even with the same
+   kernel config. If a build with identical options starts looping, compare the
+   `tools/` folders of the two zips.

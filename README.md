@@ -34,8 +34,10 @@ DroidSpaces needs Linux namespaces and IPC features that Android's GKI
    namespaces, the netfilter matches and targets UFW and fail2ban need, and
    tmpfs xattr/POSIX-ACL support.
 
-   With `droidspaces_extras` on (the default), five more symbols are enabled so
-   DroidSpaces' optional checks pass: `MACVLAN` (`--net=macvlan`), and
+   Three optional inputs enable more symbols so DroidSpaces' optional checks
+   pass (`ds_macvlan` on by default, `ds_cpu_limit` and `ds_pids_limit` off by
+   default, because they changed the kernel layout on the Quintus and the phone
+   bootloops with both on). Together they cover: `MACVLAN` (`--net=macvlan`), and
    `CGROUP_SCHED` + `FAIR_GROUP_SCHED` + `CFS_BANDWIDTH` (CPU limit, `cpu.max`)
    and `CGROUP_PIDS` (process limit, `pids.max`). `MACVLAN` and `CFS_BANDWIDTH`
    only touch private scheduler/net structs. `CGROUP_PIDS` adds `SUBSYS(pids)` to
@@ -44,7 +46,7 @@ DroidSpaces needs Linux namespaces and IPC features that Android's GKI
    `rdma`/`misc`/`debug` if those are enabled. That is the same class of change
    that keeps `CGROUP_DEVICE` off, so the extras are **not** assumed kABI-safe:
    the advisory `kabi` job compares exported symbol CRCs against `stock`, and the
-   `droidspaces_extras` input exists to switch them off if it reports drift.
+   `ds_cpu_limit` / `ds_pids_limit` inputs exist so each can be tested alone.
 
 2. **The kABI patch.** Turning on `CONFIG_SYSVIPC` normally adds
    `sysvsem`/`sysvshm` to `struct task_struct`, which shifts every field after
@@ -151,12 +153,15 @@ Actions → **Build algiz kernels** → *Run workflow*.
 
 | Input | Default | Meaning |
 |---|---|---|
-| `variants` | `all` | Build all eight, or just one variant from the dropdown. |
+| `variants` | `all` | Build all eight, or just one variant from the dropdown. `bisect-droidspaces-usbarsenal-enforcing` builds three extras test kernels (`-t1` MACVLAN, `-t2` MACVLAN + `CGROUP_PIDS`, `-t3` MACVLAN + `CFS_BANDWIDTH`) and publishes them as a **pre-release** tagged `v<kernel>-extras-test-<run>`. |
+| `prerelease` | off | Mark the release as a pre-release. Always on for the `bisect-*` option. |
 | `build_scope` | `image` | `image` builds only the GKI-side `Image`/`Image.lz4`/`Image.gz` + in-tree modules (~40–70 min per variant). `dist` runs the full MediaTek build with every vendor module (several hours, and you do not need it). |
 | `mode` | `user` | MTK build variant. `userdebug`/`eng` pull in `userdebug.config`/`eng.config`, which set `MTK_PANIC_ON_WARN`, `DEBUG_KMEMLEAK` and ~80 more debug symbols. Do not daily-drive those. |
 | `defconfig_overlays` | `mt6877_overlay.config` | `DEFCONFIG_OVERLAYS`, space separated. Pass the literal `none` for an empty list. |
 | `boot_img_url` | *(empty)* | Direct download URL of your **stock** `boot.img`. **Empty = use the one attached to the [`stock-images-algiz`](https://github.com/blue-boy-questions/custom-kernel/releases/tag/stock-images-algiz) release**, checked against its known sha256, so every build also yields repacked `<variant>-boot.img` files. A committed `boot/boot.img` always wins. |
-| `droidspaces_extras` | on | DroidSpaces variants only: also enable `MACVLAN`, `CFS_BANDWIDTH` (CPU limit) and `CGROUP_PIDS` (process limit), the three items DroidSpaces' Requirements Check reports as missing on a stock GKI config. Turn off if the kABI job reports drift or the phone bootloops. |
+| `ds_macvlan` | on | DroidSpaces variants only: enable `MACVLAN` (`--net=macvlan`). Low risk. |
+| `ds_cpu_limit` | off | DroidSpaces variants only: enable `CGROUP_SCHED` + `FAIR_GROUP_SCHED` + `CFS_BANDWIDTH` (CPU limit). Changes scheduler structs; test on its own. |
+| `ds_pids_limit` | off | DroidSpaces variants only: enable `CGROUP_PIDS` (process limit). Grows the cgroup subsystem table; test on its own. |
 | `disable_sandbox` | off | Adds `--config=local`. Only if you hit Bazel sandbox errors. |
 | `publish_release` | on | Publish one GitHub release with every variant attached. Also on by default for push-triggered runs (changes under `patches/`, `scripts/`, `local_manifests/`, `anykernel3/`, `boot/` or the workflow itself). |
 
