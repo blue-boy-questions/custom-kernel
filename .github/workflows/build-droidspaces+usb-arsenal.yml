@@ -1352,10 +1352,21 @@ jobs:
           done
           prerelease=false
           if [ "$BISECT" = "true" ] || [ "$PRERELEASE_IN" = "true" ]; then prerelease=true; fi
+          # Every release gets a brand-new tag: run number + UTC date/time.
+          stamp="$(date -u +%Y%m%d-%H%M)"
           if [ "$BISECT" = "true" ]; then
-            tag="v${kver}-extras-test-${GITHUB_RUN_NUMBER}"
+            tag="v${kver}-extras-test-${GITHUB_RUN_NUMBER}-${stamp}"
           else
-            tag="v${kver}-${GITHUB_RUN_NUMBER}"
+            tag="v${kver}-${GITHUB_RUN_NUMBER}-${stamp}"
+          fi
+          # A re-run of the same run keeps its run number, so the tag may
+          # already exist. Never fail on that: pick a fresh tag instead.
+          if gh release view "$tag" >/dev/null 2>&1; then
+            tag="${tag}-attempt${GITHUB_RUN_ATTEMPT}"
+            if gh release view "$tag" >/dev/null 2>&1; then
+              tag="${tag}-$(date -u +%H%M%S)"
+            fi
+            echo "::notice::release tag already existed, using $tag"
           fi
 
           cd "$stage"
